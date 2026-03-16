@@ -1,0 +1,27 @@
+# RustSec advisory database configuration for tell-agent
+# Docs: https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example
+
+[advisories]
+# Advisories to ignore (add RUSTSEC IDs with a comment explaining why)
+ignore = []
+
+# Treat unmaintained crate warnings as errors
+informational_warnings = ["unmaintained"]
+
+[database]
+# Auto-fetch latest advisories before scanning
+fetch = true
+# Warn if advisory DB is older than 90 days
+stale = false
+
+[output]
+# Fail on unmaintained dependencies (defense-in-depth)
+deny = ["unmaintained"]
+format = "terminal"
+quiet = false
+show_tree = true
+
+[yanked]
+# Warn if any dependency has been yanked from crates.io
+enabled = true
+update_index = true

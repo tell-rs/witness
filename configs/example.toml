@@ -1,0 +1,28 @@
+# Tell Agent — minimal config (just api_key works)
+api_key = "feed1e11feed1e11feed1e11feed1e11"
+endpoint = "localhost:50000"
+
+# Log files to tail (glob patterns supported)
+logs = [
+    "/var/log/syslog",
+    "/var/log/auth.log",
+]
+
+# Global tags — applied to all metrics and logs
+# [tags]
+# env = "production"
+# role = "web"
+
+# System monitoring — all collectors enabled by default.
+# Only write [system] to override.
+# [system]
+# processes = false
+# cgroups = false
+# process_top = 5
+
+# Filter noisy interfaces/devices
+# [system.network_filter]
+# exclude = ["docker0", "veth*", "br-*"]
+
+# [system.disk_filter]
+# exclude = ["loop*", "dm-*"]
