@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 
+use tell::Temporality;
+
 use crate::collectors::{Collector, read_procfs};
 use crate::config::DeviceFilter;
 use crate::sink::Sink;
@@ -65,6 +67,36 @@ impl Collector for DiskCollector {
         self.tick_count = self.tick_count.wrapping_add(1);
 
         collect_disk_space(sink, &self.mounts);
+    }
+
+    fn checkpoint(&mut self, sink: &Sink, _hostname: &str) {
+        for (device, stats) in &self.prev {
+            let labels: &[(&'static str, &str)] = &[("device", device)];
+            sink.counter_dyn_with_temporality(
+                "system.disk.read_bytes",
+                stats.sectors_read as f64 * SECTOR_SIZE,
+                labels,
+                Temporality::Cumulative,
+            );
+            sink.counter_dyn_with_temporality(
+                "system.disk.write_bytes",
+                stats.sectors_written as f64 * SECTOR_SIZE,
+                labels,
+                Temporality::Cumulative,
+            );
+            sink.counter_dyn_with_temporality(
+                "system.disk.read_ops",
+                stats.reads_completed as f64,
+                labels,
+                Temporality::Cumulative,
+            );
+            sink.counter_dyn_with_temporality(
+                "system.disk.write_ops",
+                stats.writes_completed as f64,
+                labels,
+                Temporality::Cumulative,
+            );
+        }
     }
 }
 
@@ -148,6 +180,28 @@ fn collect_disk_space(sink: &Sink, mounts: &[MountInfo]) {
             );
             sink.gauge_dyn("system.disk.inodes_free", inodes_free, labels);
         }
+    }
+}
+
+#[cfg(test)]
+impl DiskCollector {
+    pub fn inject_prev_stats(
+        &mut self,
+        device: &str,
+        reads_completed: u64,
+        sectors_read: u64,
+        writes_completed: u64,
+        sectors_written: u64,
+    ) {
+        self.prev.insert(
+            device.to_string(),
+            DiskStats {
+                reads_completed,
+                sectors_read,
+                writes_completed,
+                sectors_written,
+            },
+        );
     }
 }
 

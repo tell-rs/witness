@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use tell::Temporality;
+
 use crate::collectors::Collector;
 use crate::config::DeviceFilter;
 use crate::sink::Sink;
@@ -98,6 +100,36 @@ impl Collector for NetworkCollector {
             } else {
                 self.prev.insert(iface.clone(), current.clone());
             }
+        }
+    }
+
+    fn checkpoint(&mut self, sink: &Sink, _hostname: &str) {
+        for (iface, stats) in &self.prev {
+            let labels: &[(&'static str, &str)] = &[("interface", iface)];
+            sink.counter_dyn_with_temporality(
+                "system.net.bytes_recv",
+                stats.rx_bytes as f64,
+                labels,
+                Temporality::Cumulative,
+            );
+            sink.counter_dyn_with_temporality(
+                "system.net.bytes_sent",
+                stats.tx_bytes as f64,
+                labels,
+                Temporality::Cumulative,
+            );
+            sink.counter_dyn_with_temporality(
+                "system.net.packets_recv",
+                stats.rx_packets as f64,
+                labels,
+                Temporality::Cumulative,
+            );
+            sink.counter_dyn_with_temporality(
+                "system.net.packets_sent",
+                stats.tx_packets as f64,
+                labels,
+                Temporality::Cumulative,
+            );
         }
     }
 }

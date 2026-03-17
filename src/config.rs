@@ -36,8 +36,9 @@ pub struct AgentConfig {
     #[serde(default)]
     pub tags: HashMap<String, String>,
 
-    /// Log files to tail (glob patterns supported). Empty = no log tailing.
-    #[serde(default)]
+    /// Log files to tail (glob patterns supported).
+    /// Defaults to common system and service log paths. Set to `[]` to disable.
+    #[serde(default = "default_logs")]
     pub logs: Vec<String>,
 
     /// Maximum disk buffer size in bytes. Default: 3 GiB.
@@ -150,6 +151,39 @@ fn default_interval() -> Duration {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(target_os = "linux")]
+fn default_logs() -> Vec<String> {
+    vec![
+        // System
+        "/var/log/syslog".into(),
+        "/var/log/auth.log".into(),
+        "/var/log/kern.log".into(),
+        // Web servers
+        "/var/log/nginx/*.log".into(),
+        "/var/log/apache2/*.log".into(),
+        // Databases
+        "/var/log/postgresql/*.log".into(),
+        "/var/log/mysql/*.log".into(),
+        "/var/log/mongodb/*.log".into(),
+        "/var/log/redis/*.log".into(),
+        // Infrastructure
+        "/var/log/haproxy/*.log".into(),
+        "/var/log/traefik/*.log".into(),
+        "/var/log/elasticsearch/*.log".into(),
+        "/var/log/rabbitmq/*.log".into(),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn default_logs() -> Vec<String> {
+    vec!["/var/log/system.log".into()]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn default_logs() -> Vec<String> {
+    vec![]
 }
 
 fn default_top_n() -> usize {

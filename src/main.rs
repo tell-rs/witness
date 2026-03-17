@@ -257,23 +257,41 @@ async fn run(config_path: &PathBuf) -> RunResult {
 
             let mut buf = String::with_capacity(8192);
             let mut tick = tokio::time::interval(interval);
+            let mut tick_count: u32 = 0;
+
+            // 1 hour of ticks. Interval is in seconds.
+            let checkpoint_ticks = 3600 / interval.as_secs().max(1) as u32;
+
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        let (ret_c, ret_b) = tokio::task::spawn_blocking({
+                        let checkpoint = tick_count > 0 && tick_count % checkpoint_ticks == 0;
+                        match tokio::task::spawn_blocking({
                             let sink = s.clone();
                             let hostname = h.clone();
                             move || {
                                 for col in &mut collectors {
                                     col.collect(&sink, &hostname, &mut buf);
+                                    if checkpoint {
+                                        col.checkpoint(&sink, &hostname);
+                                    }
                                 }
                                 (collectors, buf)
                             }
                         })
                         .await
-                        .expect("collector task panicked");
-                        collectors = ret_c;
-                        buf = ret_b;
+                        {
+                            Ok((ret_c, ret_b)) => {
+                                collectors = ret_c;
+                                buf = ret_b;
+                            }
+                            Err(e) => {
+                                eprintln!("collector tick failed, reinitializing: {e}");
+                                collectors = collectors::init_collectors(&system_config);
+                                buf = String::with_capacity(8192);
+                            }
+                        }
+                        tick_count = tick_count.wrapping_add(1);
                     }
                     _ = cancel.changed() => return,
                 }
@@ -324,8 +342,14 @@ async fn wait_for_signal() -> Signal {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM");
-        let mut sighup = signal(SignalKind::hangup()).expect("failed to register SIGHUP");
+        let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+            eprintln!("failed to register SIGTERM handler");
+            process::exit(1);
+        };
+        let Ok(mut sighup) = signal(SignalKind::hangup()) else {
+            eprintln!("failed to register SIGHUP handler");
+            process::exit(1);
+        };
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::select! {
             _ = ctrl_c => Signal::Shutdown,

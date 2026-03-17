@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.1
+
+New:
+- collectors: hourly cumulative checkpoints for disk and network counters, recovers exact totals after outages
+- config: default log paths for system, web server, and database logs on Linux and macOS
+- readme: rewrite with logs-first positioning, updated benchmarks, removed competitor comparison tables
+
+Fix:
+- main: collector task panics reinitialize instead of crashing the process
+- main: signal handler registration uses graceful exit instead of expect
+- tail: save offsets after every data cycle, crash duplicate window from ~10s to ~250ms
+
 ## v0.1.0
 
 New:

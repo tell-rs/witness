@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tell::{LogLevel, Tell};
+use tell::{LogLevel, Tell, Temporality};
 
 /// Output sink for metrics and logs.
 ///
@@ -160,6 +160,35 @@ impl Sink {
                 dr.counter.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
                     "  counter {}{} = {}",
+                    name,
+                    fmt_labels(self.tags, labels),
+                    fmt_value(value)
+                );
+            }
+            SinkInner::Discard => {}
+        }
+    }
+
+    pub fn counter_dyn_with_temporality(
+        &self,
+        name: &'static str,
+        value: f64,
+        labels: &[(&'static str, &str)],
+        temporality: Temporality,
+    ) {
+        match &self.inner {
+            SinkInner::Live(tell) => {
+                if self.tags.is_empty() {
+                    tell.counter_dyn_with_temporality(name, value, labels, temporality);
+                } else {
+                    let m = merge_dyn(self.tags, labels);
+                    tell.counter_dyn_with_temporality(name, value, &m, temporality);
+                }
+            }
+            SinkInner::DryRun(dr) => {
+                dr.counter.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "  checkpoint {}{} = {}",
                     name,
                     fmt_labels(self.tags, labels),
                     fmt_value(value)

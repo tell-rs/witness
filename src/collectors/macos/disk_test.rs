@@ -15,3 +15,16 @@ fn disk_collects_without_panic() {
 
     collector.collect(&sink, "test", &mut buf);
 }
+
+#[test]
+fn disk_checkpoint_is_noop() {
+    let filter = DeviceFilter::new(&FilterConfig::default(), &[]);
+    let mut collector = super::disk::DiskCollector::new(filter);
+    let mut buf = String::new();
+
+    // Collect once so collector is initialized
+    collector.collect(&Sink::discard(), "test", &mut buf);
+
+    // macOS disk collector is gauges-only — checkpoint uses default no-op
+    collector.checkpoint(&Sink::discard(), "test");
+}

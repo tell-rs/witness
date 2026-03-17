@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use tell::Temporality;
+
 use crate::collectors::{Collector, read_procfs};
 use crate::config::DeviceFilter;
 use crate::sink::Sink;
@@ -39,6 +41,32 @@ impl NetworkCollector {
             prev: HashMap::new(),
             filter,
         }
+    }
+}
+
+#[cfg(test)]
+impl NetworkCollector {
+    pub fn inject_prev_stats(
+        &mut self,
+        iface: &str,
+        rx_bytes: u64,
+        rx_packets: u64,
+        tx_bytes: u64,
+        tx_packets: u64,
+    ) {
+        self.prev.insert(
+            iface.to_string(),
+            NetStats {
+                rx_bytes,
+                rx_packets,
+                rx_errors: 0,
+                rx_drops: 0,
+                tx_bytes,
+                tx_packets,
+                tx_errors: 0,
+                tx_drops: 0,
+            },
+        );
     }
 }
 
@@ -128,6 +156,36 @@ impl Collector for NetworkCollector {
             } else {
                 self.prev.insert(iface.to_string(), current);
             }
+        }
+    }
+
+    fn checkpoint(&mut self, sink: &Sink, _hostname: &str) {
+        for (iface, stats) in &self.prev {
+            let labels: &[(&'static str, &str)] = &[("interface", iface)];
+            sink.counter_dyn_with_temporality(
+                "system.net.bytes_recv",
+                stats.rx_bytes as f64,
+                labels,
+                Temporality::Cumulative,
+            );
+            sink.counter_dyn_with_temporality(
+                "system.net.bytes_sent",
+                stats.tx_bytes as f64,
+                labels,
+                Temporality::Cumulative,
+            );
+            sink.counter_dyn_with_temporality(
+                "system.net.packets_recv",
+                stats.rx_packets as f64,
+                labels,
+                Temporality::Cumulative,
+            );
+            sink.counter_dyn_with_temporality(
+                "system.net.packets_sent",
+                stats.tx_packets as f64,
+                labels,
+                Temporality::Cumulative,
+            );
         }
     }
 }

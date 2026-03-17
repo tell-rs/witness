@@ -24,6 +24,11 @@ use crate::sink::Sink;
 pub trait Collector: Send {
     fn name(&self) -> &'static str;
     fn collect(&mut self, sink: &Sink, hostname: &str, buf: &mut String);
+
+    /// Emit cumulative checkpoint values for counter metrics.
+    /// Called once per checkpoint interval (default: 1 hour). Only collectors
+    /// that track deltas (disk I/O, network) need to override this.
+    fn checkpoint(&mut self, _sink: &Sink, _hostname: &str) {}
 }
 
 /// Read a file into the shared buffer, reusing its allocation.

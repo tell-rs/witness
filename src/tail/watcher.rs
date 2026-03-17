@@ -130,6 +130,9 @@ pub async fn tail_files(
                 // Exponential backoff when idle, reset when data found
                 if total_bytes > 0 {
                     poll_interval_ms = POLL_BASE_MS;
+                    // Save offsets immediately after shipping lines to minimize
+                    // the duplicate window on crash recovery (~250ms vs ~10s).
+                    save_offsets(&files);
                 } else {
                     poll_interval_ms = (poll_interval_ms * 2).min(POLL_MAX_MS);
                 }

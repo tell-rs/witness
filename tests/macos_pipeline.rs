@@ -101,6 +101,11 @@ async fn collectors_transmit_all_metrics() {
         all_bytes.len()
     );
 
+    // Also run checkpoint — emits cumulative values
+    for col in &mut all_collectors {
+        col.checkpoint(&sink, "test-mac");
+    }
+
     // Every metric name our macOS collectors should emit:
     let expected_metrics = [
         // Load

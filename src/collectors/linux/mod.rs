@@ -12,6 +12,10 @@ pub mod tcp;
 
 #[cfg(test)]
 mod container_test;
+#[cfg(test)]
+mod disk_test;
+#[cfg(test)]
+mod network_test;
 
 use crate::collectors::Collector;
 use crate::config::{DeviceFilter, SystemConfig};

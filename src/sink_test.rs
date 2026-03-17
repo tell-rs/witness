@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::sink::{DryRun, Sink};
-use tell::LogLevel;
+use tell::{LogLevel, Temporality};
 
 fn dry_sink() -> Sink {
     Sink::dry_run(DryRun::new(), HashMap::new())
@@ -187,4 +187,38 @@ fn counter_with_tags() {
 fn counter_dyn_with_tags() {
     let iface = "eth0".to_string();
     dry_sink_with_tags().counter_dyn("test.net", 500.0, &[("iface", iface.as_str())]);
+}
+
+// --- Checkpoint (counter_dyn_with_temporality) ---
+
+#[test]
+fn checkpoint_counter_dyn_with_temporality() {
+    let device = "sda".to_string();
+    dry_sink().counter_dyn_with_temporality(
+        "system.disk.read_bytes",
+        1_000_000.0,
+        &[("device", device.as_str())],
+        Temporality::Cumulative,
+    );
+}
+
+#[test]
+fn checkpoint_counter_dyn_with_temporality_and_tags() {
+    let iface = "en0".to_string();
+    dry_sink_with_tags().counter_dyn_with_temporality(
+        "system.net.bytes_recv",
+        5_000_000.0,
+        &[("interface", iface.as_str())],
+        Temporality::Cumulative,
+    );
+}
+
+#[test]
+fn discard_counter_dyn_with_temporality() {
+    Sink::discard().counter_dyn_with_temporality(
+        "system.net.bytes_recv",
+        1.0,
+        &[("interface", "lo")],
+        Temporality::Cumulative,
+    );
 }

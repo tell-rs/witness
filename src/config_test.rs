@@ -15,7 +15,7 @@ fn minimal_config() {
     assert!(cfg.hostname.is_empty());
     assert_eq!(cfg.interval, Duration::from_secs(15));
     assert!(cfg.tags.is_empty());
-    assert!(cfg.logs.is_empty());
+    assert!(!cfg.logs.is_empty(), "should have default log paths");
     assert!(cfg.system.cpu);
     assert!(cfg.system.memory);
     assert!(cfg.system.load);
