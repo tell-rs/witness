@@ -1,9 +1,9 @@
-# Tell Agent
-
 <p align="center">
   <a href="https://doc.rust-lang.org/edition-guide/rust-2024/"><img src="https://img.shields.io/badge/Rust-2024_edition-blue.svg" alt="Rust 2024"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
+
+## What is Witness
 
 Lightweight host agent that automatically forwards log files and collects system metrics. Written in Rust, ~2 MB static binary.
 
