@@ -15,16 +15,14 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.os_arch }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            runner: blacksmith-4vcpu-ubuntu-2404
             os_arch: linux-x86_64
           - target: aarch64-unknown-linux-musl
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
             os_arch: linux-aarch64
 
     steps:
@@ -44,8 +42,9 @@ jobs:
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -60,6 +59,7 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
@@ -82,7 +82,7 @@ jobs:
   release:
     name: Create Release
     needs: [build]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4

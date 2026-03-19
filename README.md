@@ -5,7 +5,7 @@
 
 ## What is Witness
 
-Lightweight host agent that automatically forwards log files and collects system metrics. Ships data via the Tell binary protocol (FlatBuffers over TCP) or OTLP. Written in Rust, ~1.2 MB static binary.
+Lightweight host agent that automatically forwards log files and collects system metrics. Ships data via the Tell binary protocol (FlatBuffers over TCP). Written in Rust, ~1.2 MB static binary.
 
 - **Logs** — Automatically forwards your log files to a central collector. Handles rotation, crashes, and restarts out of the box.
 - **Metrics** — CPU, memory, disk, network, load, TCP state, cgroups, and top processes. Per-core and per-device, all out of the box.
@@ -61,20 +61,15 @@ Collected every 15 seconds (configurable). All enabled by default, individually 
 - **cgroups** — container-aware CPU and memory from cgroups v2
 - **Processes** — top N by CPU and memory usage
 
-Counter metrics (disk, network, cgroups) are shipped as **deltas** — the natural format for SQL backends like ClickHouse, where rates are a simple SUM() over any time window. Cumulative totals are checkpointed every hour for drift correction.
-
 ## Performance
 
-SDK-level time to encode and enqueue a single data point. Benchmarked on Apple M4 Pro:
+All data is batched and sent over a persistent TCP connection using a binary protocol — no JSON, no HTTP. Metrics are encoded directly into reusable buffers with zero heap allocations. SDK-level time to encode and enqueue a single data point, benchmarked on Apple M4 Pro:
 
 | Operation | Example | Latency |
 |---|---|---|
 | Log line | application log with structured fields | **76 ns** |
 | Metric (point-in-time) | memory used, disk space, CPU % | **30 ns** |
 | Metric (delta) | network bytes, disk I/O since last tick | **31 ns** |
-
-- **Binary protocol** — all data is batched and sent over a persistent TCP connection. No JSON, no HTTP.
-- **Zero heap allocations** — metrics are encoded directly into reusable buffers. No garbage collection pressure.
 
 ## Reliability
 
@@ -113,11 +108,11 @@ Metrics:
 | Memory (idle) | **4 MB** | 40 MB |
 | Memory (active) | **7 MB** | 40 MB |
 
-Vector built with minimal features (file source, host metrics, socket sink). Witness is a collection agent — transforms and routing live in the collector (separate ~3 MB binary). Vector bundles collection, transforms, and routing into one binary.
+Vector was built with minimal features (file source, host metrics, socket sink).
 
-## Testing
+## Test Coverage
 
-86% line coverage across unit, integration, and end-to-end pipeline tests.
+86% line test coverage
 
 ## License
 
