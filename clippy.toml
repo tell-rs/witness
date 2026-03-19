@@ -1,4 +1,5 @@
 allow-expect-in-tests = true
 allow-unwrap-in-tests = true
 
+# Match tell-rs threshold to accommodate richer error variants.
 large-error-threshold = 256

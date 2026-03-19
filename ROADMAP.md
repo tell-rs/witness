@@ -1,3 +1,3 @@
 # ROADMAP 
 
- - Cloud managed configs for auto-deployments
+ - Cloud managed configs for auto-deployments and managed configs

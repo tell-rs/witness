@@ -13,9 +13,9 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
 use tell::{Tell, TellConfig};
-use tell_agent::collectors;
-use tell_agent::config::SystemConfig;
-use tell_agent::sink::Sink;
+use witness::config::SystemConfig;
+use witness::metrics;
+use witness::sink::Sink;
 
 /// Read one length-prefixed frame from a TCP stream.
 async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
@@ -56,7 +56,7 @@ async fn collectors_transmit_all_metrics() {
     let config = TellConfig::builder("feed1e11feed1e11feed1e11feed1e11")
         .endpoint(addr.to_string())
         .source("test-mac")
-        .service("tell-agent")
+        .service("witness")
         .batch_size(500)
         .flush_interval(Duration::from_secs(60))
         .build()
@@ -67,7 +67,7 @@ async fn collectors_transmit_all_metrics() {
 
     // 3. Initialize the actual macOS collectors
     let sys_config = SystemConfig::default();
-    let mut all_collectors = collectors::init_collectors(&sys_config);
+    let mut all_collectors = metrics::init_collectors(&sys_config);
 
     let names: Vec<&str> = all_collectors.iter().map(|c| c.name()).collect();
     eprintln!("initialized collectors: {}", names.join(", "));
@@ -168,8 +168,8 @@ async fn collectors_transmit_all_metrics() {
         }
     );
     eprintln!(
-        "  service 'tell-agent'  {}",
-        if frame_contains(&all_bytes, "tell-agent") {
+        "  service 'witness'  {}",
+        if frame_contains(&all_bytes, "witness") {
             "found"
         } else {
             "MISSING"

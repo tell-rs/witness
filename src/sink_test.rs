@@ -96,7 +96,7 @@ fn gauge_value_integer() {
 
 #[test]
 fn gauge_value_fractional() {
-    dry_sink().gauge("test.frac", 3.14, &[]);
+    dry_sink().gauge("test.frac", 2.78, &[]);
 }
 
 // --- Mixed calls ---

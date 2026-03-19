@@ -1,0 +1,18 @@
+[Unit]
+Description=Witness Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/witness --config /etc/tell/agent.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+User=witness
+Group=witness
+ReadOnlyPaths=/proc /sys /var/log
+StateDirectory=witness
+
+[Install]
+WantedBy=multi-user.target

@@ -311,7 +311,7 @@ interval = "10s"
     )
     .unwrap();
 
-    let cfg = crate::config::load_config(&path.to_path_buf()).unwrap();
+    let cfg = crate::config::load_config(&path).unwrap();
     assert_eq!(cfg.api_key, "feed1e11feed1e11feed1e11feed1e11");
     assert_eq!(cfg.endpoint, "collector:9000");
     assert_eq!(cfg.interval, std::time::Duration::from_secs(10));
@@ -328,5 +328,5 @@ fn load_config_invalid_toml_fails() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bad.toml");
     std::fs::write(&path, "not valid toml {{{{").unwrap();
-    assert!(crate::config::load_config(&path.to_path_buf()).is_err());
+    assert!(crate::config::load_config(&path).is_err());
 }

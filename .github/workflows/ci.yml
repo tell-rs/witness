@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Clippy
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo clippy --all-targets -- -D warnings -A clippy::collapsible_if
+
+  test:
+    name: Test
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Build
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo build --all
+      - name: Test
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo nextest run --all --no-fail-fast

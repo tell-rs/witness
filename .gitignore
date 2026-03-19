@@ -14,3 +14,6 @@ debug/
 
 # Claude Code
 .claude/
+
+# Benchmark related
+/vector

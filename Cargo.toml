@@ -1,16 +1,28 @@
 [package]
-name = "tell-agent"
-version = "0.1.1"
+name = "witness"
+version = "0.1.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.93"
 description = "Lightweight host monitoring agent for the Tell platform"
 license = "MIT"
 authors = ["Tell Contributors"]
-repository = "https://github.com/tell-rs/tell-agent"
+repository = "https://github.com/tell-rs/witness"
+
+[[example]]
+name = "bench_throughput"
+path = "benchmark/bench_throughput.rs"
+
+[[example]]
+name = "null_receiver"
+path = "benchmark/null_receiver.rs"
+
+[[example]]
+name = "gen_logs"
+path = "benchmark/gen_logs.rs"
 
 [dependencies]
-tell = { path = "../SDKs/tell-rs/crates/tell" }
-tokio = { version = "1.43", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "fs", "io-util"] }
+tell = "0.4"
+tokio = { version = "1.43", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "fs", "io-util", "process"] }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"

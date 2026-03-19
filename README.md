@@ -5,13 +5,13 @@
 
 ## What is Witness
 
-Lightweight host agent that automatically forwards log files and collects system metrics. Written in Rust, ~2 MB static binary.
+Lightweight host agent that automatically forwards log files and collects system metrics. Ships data via the Tell binary protocol (FlatBuffers over TCP) or OTLP. Written in Rust, ~1.2 MB static binary.
 
 - **Logs** — Automatically forwards your log files to a central collector. Handles rotation, crashes, and restarts out of the box.
 - **Metrics** — CPU, memory, disk, network, load, TCP state, cgroups, and top processes. Per-core and per-device, all out of the box.
 - **Reliable** — Disk-buffered delivery, atomic offset persistence, both rename and copytruncate rotation. Nothing lost.
 - **Fast** — 76 ns per log line, 30 ns per metric, zero steady-state allocations. Your servers stay yours.
-- **Single binary** — Written in Rust, ~2 MB static binary. Memory safe, no garbage collector, no runtime dependencies.
+- **Single binary** — No garbage collector, no runtime dependencies. Memory safe by default.
 
 ## Use cases
 
@@ -25,16 +25,18 @@ Lightweight host agent that automatically forwards log files and collects system
 **1. Install**
 
 ```bash
-curl -sSL https://get.tell.rs/agent | bash -s -- --api-key YOUR_KEY
+curl -sSfL https://tell.rs/agent | bash
 ```
 
-**2. Verify**
+**2. Configure**
 
 ```bash
-systemctl status tell-agent
+witness setup --token YOUR_API_KEY
 ```
 
-Logs and metrics start flowing within 15 seconds — zero configuration needed. To customise log paths, tags, or device filters see [configs/example.toml](configs/example.toml).
+Writes the config and starts collecting. Verify with `systemctl status witness`.
+
+Logs and metrics start flowing within 15 seconds. To customise log paths, tags, or device filters see [configs/example.toml](configs/example.toml). For self-hosted or air-gapped installs see [INSTALL.md](INSTALL.md).
 
 ## Logs
 
@@ -59,12 +61,14 @@ Collected every 15 seconds (configurable). All enabled by default, individually 
 - **cgroups** — container-aware CPU and memory from cgroups v2
 - **Processes** — top N by CPU and memory usage
 
+Counter metrics (disk, network, cgroups) are shipped as **deltas** — the natural format for SQL backends like ClickHouse, where rates are a simple SUM() over any time window. Cumulative totals are checkpointed every hour for drift correction.
+
 ## Performance
 
 SDK-level time to encode and enqueue a single data point. Benchmarked on Apple M4 Pro:
 
 | Operation | Example | Latency |
-|-----------|---------|---------|
+|---|---|---|
 | Log line | application log with structured fields | **76 ns** |
 | Metric (point-in-time) | memory used, disk space, CPU % | **30 ns** |
 | Metric (delta) | network bytes, disk I/O since last tick | **31 ns** |
@@ -100,6 +104,16 @@ Metrics:
 - **Independent modules.** If one metric source fails (e.g., a permission error on disk stats), the others keep reporting. No cascading failures.
 - **Counter safe.** Kernel counter wraps or resets after reboots are handled gracefully — always produces valid values, never negative numbers or crashes.
 - **Hourly checkpoints.** Cumulative counter values are sent every hour alongside deltas. If data is lost during an outage, the checkpoints provide exact totals — no permanent drift.
+
+## Witness vs Vector
+
+| | Witness | Vector |
+|---|---|---|
+| Binary | **1.2 MB** | 46 MB |
+| Memory (idle) | **4 MB** | 40 MB |
+| Memory (active) | **7 MB** | 40 MB |
+
+Vector built with minimal features (file source, host metrics, socket sink). Witness is a collection agent — transforms and routing live in the collector (separate ~3 MB binary). Vector bundles collection, transforms, and routing into one binary.
 
 ## Testing
 

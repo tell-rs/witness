@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.1.2
+
+New:
+- setup: witness setup subcommand fetches config from server or generates defaults, validates token format before any network call
+- config: api_key validated at load time (32 hex chars), platform-aware state directory on macOS
+- config: example.toml shows all options commented out with platform-aware log path defaults
+- ci: GitHub Actions for format, clippy, test, and multi-arch musl release builds
+- benchmark: throughput harness with null TCP receiver and log generator for Witness vs Vector comparison
+
+Fix:
+- sink: tag slice uses Arc instead of Box::leak, no longer leaks memory on SIGHUP reload
+- sink: DryRun counter is per-instance instead of global static, safe for parallel tests
+- process: stale PID cleanup uses HashSet instead of Vec for O(1) contains
+- config: parse_duration no longer uses unreachable!() panic path
+- logs: module doc corrected from inotify/notify to polling-based design
+- systemd: witness.service adds ExecReload for SIGHUP config reload
+
 ## v0.1.1
 
 New:

@@ -1,12 +1,31 @@
-# Tell Agent — minimal config (just api_key works)
+# Witness Agent Configuration
+#
+# Minimal config: just api_key. Everything else has sensible defaults.
+
+# API key for authentication (32 hex chars, required)
 api_key = "feed1e11feed1e11feed1e11feed1e11"
-endpoint = "localhost:50000"
+
+# Collector endpoint (default: localhost:50000)
+# endpoint = "localhost:50000"
+
+# Hostname override (auto-detected if omitted)
+# hostname = "my-server"
+
+# Collection interval (default: 15s, supports ms/s/m/h)
+# interval = "15s"
+
+# Batch size — data points per TCP flush (default: 500)
+# batch_size = 500
+
+# Maximum disk buffer size in bytes (default: 3 GiB)
+# buffer_max_bytes = 3221225472
 
 # Log files to tail (glob patterns supported)
-logs = [
-    "/var/log/syslog",
-    "/var/log/auth.log",
-]
+# Platform-aware defaults are used when omitted:
+#   Linux: syslog, auth, nginx, postgres, mysql, mongodb, redis, haproxy, etc.
+#   macOS: /var/log/system.log
+# Set to [] to disable. Override to add your own:
+# logs = ["/var/log/myapp/*.log"]
 
 # Global tags — applied to all metrics and logs
 # [tags]
@@ -14,15 +33,25 @@ logs = [
 # role = "web"
 
 # System monitoring — all collectors enabled by default.
-# Only write [system] to override.
+# Only add [system] to override specific collectors.
 # [system]
-# processes = false
-# cgroups = false
-# process_top = 5
+# cpu = true
+# memory = true
+# load = true
+# disk = true
+# network = true
+# tcp = true          # Linux only
+# cgroups = true      # Linux only
+# containers = true   # Linux only
+# processes = true    # Linux only
+# process_top = 10    # Top N processes by CPU/memory
 
-# Filter noisy interfaces/devices
+# Filter network interfaces
 # [system.network_filter]
+# include = ["eth*"]
 # exclude = ["docker0", "veth*", "br-*"]
 
+# Filter disk devices
 # [system.disk_filter]
+# include = ["sd*", "nvme*"]
 # exclude = ["loop*", "dm-*"]

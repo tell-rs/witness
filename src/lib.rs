@@ -1,7 +1,7 @@
-pub mod collectors;
 pub mod config;
+pub mod logs;
+pub mod metrics;
 pub mod sink;
-pub mod tail;
 
 #[cfg(test)]
 mod config_test;

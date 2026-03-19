@@ -41,6 +41,10 @@ pub struct AgentConfig {
     #[serde(default = "default_logs")]
     pub logs: Vec<String>,
 
+    /// Batch size — number of data points per TCP flush. Default: 500.
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+
     /// Maximum disk buffer size in bytes. Default: 3 GiB.
     /// The disk buffer persists unsent data during network outages.
     /// Oldest data is evicted when this limit is reached.
@@ -186,6 +190,10 @@ fn default_logs() -> Vec<String> {
     vec![]
 }
 
+fn default_batch_size() -> usize {
+    500
+}
+
 fn default_top_n() -> usize {
     10
 }
@@ -206,31 +214,34 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         return Err("empty duration string".to_string());
     }
 
-    let (num_str, suffix) = if let Some(n) = s.strip_suffix("ms") {
-        (n, "ms")
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, "s")
-    } else if let Some(n) = s.strip_suffix('m') {
-        (n, "m")
-    } else if let Some(n) = s.strip_suffix('h') {
-        (n, "h")
-    } else {
-        return Err(format!(
-            "unknown duration suffix in '{s}', expected ms/s/m/h"
-        ));
-    };
-
-    let value: u64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid number in duration '{s}'"))?;
-
-    match suffix {
-        "ms" => Ok(Duration::from_millis(value)),
-        "s" => Ok(Duration::from_secs(value)),
-        "m" => Ok(Duration::from_secs(value * 60)),
-        "h" => Ok(Duration::from_secs(value * 3600)),
-        _ => unreachable!(),
+    if let Some(n) = s.strip_suffix("ms") {
+        let v: u64 = n
+            .parse()
+            .map_err(|_| format!("invalid number in duration '{s}'"))?;
+        return Ok(Duration::from_millis(v));
     }
+    if let Some(n) = s.strip_suffix('s') {
+        let v: u64 = n
+            .parse()
+            .map_err(|_| format!("invalid number in duration '{s}'"))?;
+        return Ok(Duration::from_secs(v));
+    }
+    if let Some(n) = s.strip_suffix('m') {
+        let v: u64 = n
+            .parse()
+            .map_err(|_| format!("invalid number in duration '{s}'"))?;
+        return Ok(Duration::from_secs(v * 60));
+    }
+    if let Some(n) = s.strip_suffix('h') {
+        let v: u64 = n
+            .parse()
+            .map_err(|_| format!("invalid number in duration '{s}'"))?;
+        return Ok(Duration::from_secs(v * 3600));
+    }
+
+    Err(format!(
+        "unknown duration suffix in '{s}', expected ms/s/m/h"
+    ))
 }
 
 // --- Device filter ---
@@ -276,7 +287,45 @@ impl DeviceFilter {
 pub fn load_config(path: &PathBuf) -> Result<AgentConfig, Box<dyn std::error::Error>> {
     let contents = std::fs::read_to_string(path)?;
     let config: AgentConfig = toml::from_str(&contents)?;
+    validate_api_key(&config.api_key)?;
     Ok(config)
+}
+
+fn validate_api_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if key.is_empty() {
+        return Err("api_key is required".into());
+    }
+    if key.len() != 32 {
+        return Err(format!("api_key must be 32 hex characters, got {}", key.len()).into());
+    }
+    if !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("api_key must contain only hex characters (0-9, a-f)".into());
+    }
+    Ok(())
+}
+
+/// Platform-appropriate state directory.
+/// Linux: /var/lib/witness (systemd StateDirectory=witness creates this)
+/// macOS: ~/Library/Application Support/witness
+pub fn state_dir() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::OnceLock;
+        static DIR: OnceLock<String> = OnceLock::new();
+        DIR.get_or_init(|| {
+            if let Some(home) = std::env::var_os("HOME") {
+                let p = std::path::Path::new(&home).join("Library/Application Support/witness");
+                p.to_string_lossy().into_owned()
+            } else {
+                "/tmp/witness".to_string()
+            }
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        "/var/lib/witness"
+    }
 }
 
 /// Auto-detect hostname if not configured.

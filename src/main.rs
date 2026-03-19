@@ -1,20 +1,24 @@
-mod collectors;
 mod config;
+mod logs;
+mod metrics;
+mod setup;
 mod sink;
-mod tail;
 
 use std::path::PathBuf;
 use std::process;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tell::{Tell, TellConfig};
 
-use crate::config::{load_config, resolve_hostname};
+use crate::config::{load_config, resolve_hostname, state_dir};
 use crate::sink::{DryRun, Sink};
 
 #[derive(Parser)]
-#[command(name = "tell-agent", about = "Tell host monitoring agent")]
+#[command(name = "witness", about = "Witness host monitoring agent")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to config file
     #[arg(short, long, default_value = "/etc/tell/agent.toml")]
     config: PathBuf,
@@ -25,9 +29,20 @@ struct Cli {
     dry_run: bool,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Fetch configuration from a Tell server and write it to disk
+    Setup(setup::SetupArgs),
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    if let Some(Command::Setup(args)) = cli.command {
+        setup::run(args);
+        return;
+    }
 
     if cli.dry_run {
         dry_run(&cli.config).await;
@@ -38,7 +53,7 @@ async fn main() {
     loop {
         match run(&cli.config).await {
             RunResult::Shutdown => {
-                eprintln!("tell-agent stopped");
+                eprintln!("witness stopped");
                 return;
             }
             RunResult::Reload => {
@@ -65,10 +80,10 @@ async fn dry_run(config_path: &PathBuf) {
     let dr = DryRun::new();
     let sink = Sink::dry_run(dr.clone(), cfg.tags.clone());
 
-    eprintln!("tell-agent dry-run (host={hostname})\n");
+    eprintln!("witness dry-run (host={hostname})\n");
 
     // --- Metrics ---
-    let mut all = collectors::init_collectors(&cfg.system);
+    let mut all = metrics::init_collectors(&cfg.system);
     if all.is_empty() {
         eprintln!("no collectors available for this platform");
     } else {
@@ -148,7 +163,7 @@ async fn dry_run(config_path: &PathBuf) {
         let cancel = shutdown_tx.subscribe();
 
         let tailer = tokio::spawn(async move {
-            tail::watcher::tail_files(&paths, log_sink, cancel).await;
+            logs::tail_files(&paths, log_sink, cancel).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -185,8 +200,8 @@ async fn run(config_path: &PathBuf) -> RunResult {
     let hostname = resolve_hostname(&cfg.hostname);
     let interval = cfg.interval;
 
-    let buffer_dir = std::path::Path::new("/var/lib/tell-agent/buffer");
-    match std::fs::create_dir_all(buffer_dir) {
+    let buffer_dir = std::path::Path::new(state_dir()).join("buffer");
+    match std::fs::create_dir_all(&buffer_dir) {
         Ok(()) => {}
         Err(e) => {
             eprintln!(
@@ -201,9 +216,9 @@ async fn run(config_path: &PathBuf) -> RunResult {
 
     let mut builder = TellConfig::builder(&cfg.api_key)
         .endpoint(&cfg.endpoint)
-        .service("tell-agent")
+        .service("witness")
         .source(&hostname)
-        .batch_size(500)
+        .batch_size(cfg.batch_size)
         .flush_interval(interval)
         .buffer_path(buffer_dir);
 
@@ -229,7 +244,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
 
     let sink = Sink::live(client, cfg.tags);
 
-    eprintln!("tell-agent starting (host={hostname}, interval={interval:?})");
+    eprintln!("witness starting (host={hostname}, interval={interval:?})");
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
@@ -240,7 +255,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
         let mut cancel = shutdown_tx.subscribe();
         let system_config = cfg.system;
         Some(tokio::spawn(async move {
-            let mut collectors = collectors::init_collectors(&system_config);
+            let mut collectors = metrics::init_collectors(&system_config);
             if collectors.is_empty() {
                 eprintln!("no collectors available for this platform");
                 return;
@@ -265,7 +280,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        let checkpoint = tick_count > 0 && tick_count % checkpoint_ticks == 0;
+                        let checkpoint = tick_count > 0 && tick_count.is_multiple_of(checkpoint_ticks);
                         match tokio::task::spawn_blocking({
                             let sink = s.clone();
                             let hostname = h.clone();
@@ -287,7 +302,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
                             }
                             Err(e) => {
                                 eprintln!("collector tick failed, reinitializing: {e}");
-                                collectors = collectors::init_collectors(&system_config);
+                                collectors = metrics::init_collectors(&system_config);
                                 buf = String::with_capacity(8192);
                             }
                         }
@@ -306,7 +321,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
         let cancel = shutdown_tx.subscribe();
         Some(tokio::spawn(async move {
             eprintln!("tailing: {paths:?}");
-            tail::watcher::tail_files(&paths, s, cancel).await;
+            logs::tail_files(&paths, s, cancel).await;
         }))
     } else {
         None
