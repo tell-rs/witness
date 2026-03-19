@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3
+
+Fix:
+- container: test used 68-char hex ID instead of 64, causing parse_containerd_scope to fail
+- ci: explicit rustup target add for aarch64-unknown-linux-musl to fix cross-compilation build
+
 ## v0.1.2
 
 New:

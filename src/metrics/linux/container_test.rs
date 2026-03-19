@@ -15,7 +15,7 @@ fn parse_docker_scope() {
 
 #[test]
 fn parse_containerd_scope() {
-    let id = "ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
+    let id = "ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
     let name = format!("cri-containerd-{id}.scope");
     let info =
         parse_scope_entry(&name, "cri-containerd-", "containerd", PathBuf::from("/x")).unwrap();

@@ -553,7 +553,9 @@ dependencies = [
 
 [[package]]
 name = "tell"
-version = "0.3.0"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "025f368591cee8b6d40da48aa542ec3fecd4cc08083fa66fdedaa7846efa71e8"
 dependencies = [
  "crossfire",
  "parking_lot",
@@ -568,7 +570,9 @@ dependencies = [
 
 [[package]]
 name = "tell-encoding"
-version = "0.3.0"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d3b772ad9784818b9f3ad50beac2b1fa66804de03eb8ec156a67e79aa398dcc"
 
 [[package]]
 name = "tempfile"
@@ -949,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "witness"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
