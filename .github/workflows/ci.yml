@@ -38,12 +38,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Clippy
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo clippy --all-targets -- -D warnings -A clippy::collapsible_if
 
   test:
@@ -57,17 +52,9 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Build
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo build --all
       - name: Test
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo nextest run --all --no-fail-fast

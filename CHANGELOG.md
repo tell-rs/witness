@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.4
+
+New:
+- install: witness install subcommand handles full setup — binary, user, systemd, config, start
+- security: hardened systemd unit with syscall filtering, kernel protection, namespace lockdown
+
+Fix:
+- config: paths moved from /etc/tell/agent.toml to /etc/witness/config.toml
+- dist: example config and systemd unit consolidated into dist/
+
 ## v0.1.3
 
 Fix:

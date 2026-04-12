@@ -36,7 +36,7 @@ witness setup --token YOUR_API_KEY
 
 Writes the config and starts collecting. Verify with `systemctl status witness`.
 
-Logs and metrics start flowing within 15 seconds. To customise log paths, tags, or device filters see [configs/example.toml](configs/example.toml). For self-hosted or air-gapped installs see [INSTALL.md](INSTALL.md).
+Logs and metrics start flowing within 15 seconds. To customise log paths, tags, or device filters see [dist/config.toml](dist/config.toml). For self-hosted or air-gapped installs see [INSTALL.md](INSTALL.md).
 
 ## Logs
 

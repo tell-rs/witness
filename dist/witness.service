@@ -1,0 +1,45 @@
+[Unit]
+Description=Witness Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/witness --config /etc/witness/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+User=witness
+Group=witness
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=witness
+
+StateDirectory=witness
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/proc /sys /var/log
+ReadWritePaths=/var/lib/witness
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=yes
+PrivateDevices=yes
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

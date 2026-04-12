@@ -25,7 +25,7 @@ pub struct SetupArgs {
     pub endpoint: Option<String>,
 
     /// Config file path to write
-    #[arg(short, long, default_value = "/etc/tell/agent.toml")]
+    #[arg(short, long, default_value = "/etc/witness/config.toml")]
     pub config: PathBuf,
 
     /// Overwrite existing config file
@@ -38,6 +38,11 @@ pub fn run(args: SetupArgs) {
         eprintln!("setup failed: {e}");
         std::process::exit(1);
     }
+}
+
+/// Run setup, returning errors to the caller instead of exiting.
+pub fn execute_checked(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
+    execute(args)
 }
 
 fn execute(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {

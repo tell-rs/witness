@@ -26,7 +26,7 @@ Pre-stage the binary via internal mirror, USB, or config management. Then:
 witness setup --token YOUR_API_KEY --endpoint your-server:50000
 ```
 
-Or write `/etc/tell/agent.toml` directly:
+Or write `/etc/witness/config.toml` directly:
 
 ```toml
 api_key = "your-api-key"
@@ -37,4 +37,4 @@ Then: `systemctl enable --now witness`
 
 ### Configuration
 
-Default config works out of the box. To customise log paths, tags, or device filters see [configs/example.toml](configs/example.toml). Reload without downtime: `systemctl reload witness`
+Default config works out of the box. To customise log paths, tags, or device filters see [dist/config.toml](dist/config.toml). Reload without downtime: `systemctl reload witness`

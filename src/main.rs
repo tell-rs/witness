@@ -1,4 +1,5 @@
 mod config;
+mod install;
 mod logs;
 mod metrics;
 mod setup;
@@ -20,7 +21,7 @@ struct Cli {
     command: Option<Command>,
 
     /// Path to config file
-    #[arg(short, long, default_value = "/etc/tell/agent.toml")]
+    #[arg(short, long, default_value = "/etc/witness/config.toml")]
     config: PathBuf,
 
     /// Print what would be collected without sending. Runs two collection
@@ -31,6 +32,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Full install: create user, systemd service, config, and start
+    Install(install::InstallArgs),
     /// Fetch configuration from a Tell server and write it to disk
     Setup(setup::SetupArgs),
 }
@@ -38,6 +41,11 @@ enum Command {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    if let Some(Command::Install(args)) = cli.command {
+        install::run(args);
+        return;
+    }
 
     if let Some(Command::Setup(args)) = cli.command {
         setup::run(args);

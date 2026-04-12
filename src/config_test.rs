@@ -300,7 +300,7 @@ include = ["disk*"]
 #[test]
 fn load_config_from_file() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("agent.toml");
+    let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
         r#"
