@@ -11,7 +11,7 @@ use std::process;
 use clap::{Parser, Subcommand};
 use tell::{Tell, TellConfig};
 
-use crate::config::{load_config, resolve_hostname, state_dir};
+use crate::config::{LogSource, load_config, resolve_hostname, state_dir};
 use crate::sink::{DryRun, Sink};
 
 #[derive(Parser)]
@@ -119,8 +119,32 @@ async fn dry_run(config_path: &PathBuf) {
     }
 
     // --- Logs ---
-    if !cfg.logs.is_empty() {
-        eprintln!("\n[logs]");
+    let use_journal = match cfg.log_source {
+        LogSource::Journald => {
+            if logs::journal::is_available() {
+                true
+            } else {
+                eprintln!("\n[logs — journald — ERROR: journalctl not available]");
+                false
+            }
+        }
+        LogSource::Files => false,
+        LogSource::Auto => logs::journal::is_available(),
+    };
+
+    if use_journal {
+        eprintln!("\n[logs — journald]");
+        let log_sink = sink.clone();
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let cancel = shutdown_tx.subscribe();
+        let tailer = tokio::spawn(async move {
+            logs::tail_journal(log_sink, cancel).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let _ = shutdown_tx.send(true);
+        let _ = tailer.await;
+    } else if !cfg.logs.is_empty() {
+        eprintln!("\n[logs — files]");
 
         // Check each configured path and report status
         for pattern in &cfg.logs {
@@ -169,11 +193,9 @@ async fn dry_run(config_path: &PathBuf) {
         let paths = cfg.logs.clone();
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let cancel = shutdown_tx.subscribe();
-
         let tailer = tokio::spawn(async move {
-            logs::tail_files(&paths, log_sink, cancel).await;
+            logs::tail_files(&paths, log_sink, cancel, cfg.parse_syslog).await;
         });
-
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         let _ = shutdown_tx.send(true);
         let _ = tailer.await;
@@ -322,17 +344,39 @@ async fn run(config_path: &PathBuf) -> RunResult {
         }))
     };
 
-    // Spawn log tailing
-    let tailer_handle = if !cfg.logs.is_empty() {
-        let s = sink.clone();
-        let paths = cfg.logs.clone();
-        let cancel = shutdown_tx.subscribe();
-        Some(tokio::spawn(async move {
-            eprintln!("tailing: {paths:?}");
-            logs::tail_files(&paths, s, cancel).await;
-        }))
-    } else {
-        None
+    // Spawn log source (journald or file tailing)
+    let tailer_handle = {
+        let use_journal = match cfg.log_source {
+            LogSource::Journald => {
+                if !logs::journal::is_available() {
+                    eprintln!("ERROR: log_source = \"journald\" but journalctl is not available");
+                    process::exit(1);
+                }
+                true
+            }
+            LogSource::Files => false,
+            LogSource::Auto => logs::journal::is_available(),
+        };
+
+        if use_journal {
+            let s = sink.clone();
+            let cancel = shutdown_tx.subscribe();
+            Some(tokio::spawn(async move {
+                eprintln!("log source: journald");
+                logs::tail_journal(s, cancel).await;
+            }))
+        } else if !cfg.logs.is_empty() {
+            let s = sink.clone();
+            let paths = cfg.logs.clone();
+            let cancel = shutdown_tx.subscribe();
+            let parse_syslog = cfg.parse_syslog;
+            Some(tokio::spawn(async move {
+                eprintln!("log source: files {paths:?}");
+                logs::tail_files(&paths, s, cancel, parse_syslog).await;
+            }))
+        } else {
+            None
+        }
     };
 
     // Wait for signal

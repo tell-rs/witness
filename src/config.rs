@@ -21,6 +21,12 @@ pub struct AgentConfig {
     #[serde(default = "default_endpoint")]
     pub endpoint: String,
 
+    /// Tell server URL for auto-config. Omit to disable.
+    /// Reserved for future auto-refresh support.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub server: Option<String>,
+
     /// Hostname override. Auto-detected if empty or absent.
     #[serde(default)]
     pub hostname: String,
@@ -36,7 +42,21 @@ pub struct AgentConfig {
     #[serde(default)]
     pub tags: HashMap<String, String>,
 
+    /// Log source backend. Default: `auto`.
+    /// - `auto` — use journald if available, fall back to file tailing
+    /// - `journald` — journald only (exits if journalctl not available)
+    /// - `files` — file tailing only
+    #[serde(default = "default_log_source")]
+    pub log_source: LogSource,
+
+    /// Parse syslog lines to extract service name and message body.
+    /// Only applies when `log_source` is "files" or "auto" (file tailing path).
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub parse_syslog: bool,
+
     /// Log files to tail (glob patterns supported).
+    /// Only applies when `log_source` is "files" or "auto" (file tailing fallback).
     /// Defaults to common system and service log paths. Set to `[]` to disable.
     #[serde(default = "default_logs")]
     pub logs: Vec<String>,
@@ -143,6 +163,22 @@ impl Default for SystemConfig {
             disk_filter: FilterConfig::default(),
         }
     }
+}
+
+/// Log source backend selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogSource {
+    /// Use journald if available, fall back to file tailing.
+    Auto,
+    /// Journald only — exits if journalctl is not available.
+    Journald,
+    /// File tailing only.
+    Files,
+}
+
+fn default_log_source() -> LogSource {
+    LogSource::Auto
 }
 
 fn default_endpoint() -> String {

@@ -112,6 +112,7 @@ pub async fn tail_files(
     patterns: &[String],
     sink: Sink,
     mut cancel: tokio::sync::watch::Receiver<bool>,
+    parse_syslog: bool,
 ) {
     let saved = load_offsets();
     let mut files: HashMap<FileId, TailedFile> = HashMap::new();
@@ -137,7 +138,7 @@ pub async fn tail_files(
         tokio::select! {
             // Poll all files
             _ = tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)) => {
-                let total_bytes = poll_all(&mut files, &mut path_index, &sink);
+                let total_bytes = poll_all(&mut files, &mut path_index, &sink, parse_syslog);
 
                 // Fast catchup when data is flowing, backoff when idle
                 if total_bytes > 0 {
@@ -188,7 +189,7 @@ pub async fn tail_files(
             // Shutdown
             _ = cancel.changed() => {
                 // Final drain — read all remaining lines including retained fds
-                poll_all(&mut files, &mut path_index, &sink);
+                poll_all(&mut files, &mut path_index, &sink, parse_syslog);
                 for f in files.values_mut() {
                     flush_partial(f, &sink);
                 }
@@ -262,6 +263,7 @@ fn poll_all(
     files: &mut HashMap<FileId, TailedFile>,
     path_index: &mut HashMap<PathBuf, FileId>,
     sink: &Sink,
+    parse_syslog: bool,
 ) -> u64 {
     let mut total_bytes = 0u64;
 
@@ -274,10 +276,10 @@ fn poll_all(
 
         // First: drain any retained fd from a previous rotation
         if tailed.retained_fd.is_some() {
-            total_bytes += drain_retained(tailed, sink);
+            total_bytes += drain_retained(tailed, sink, parse_syslog);
         }
 
-        match check_and_read(tailed, sink) {
+        match check_and_read(tailed, sink, parse_syslog) {
             ReadResult::Bytes(n) => {
                 tailed.open_failures = 0;
                 tailed.last_active = Instant::now();
@@ -315,7 +317,7 @@ enum ReadResult {
     Idle,
 }
 
-fn check_and_read(tailed: &mut TailedFile, sink: &Sink) -> ReadResult {
+fn check_and_read(tailed: &mut TailedFile, sink: &Sink, parse_syslog: bool) -> ReadResult {
     let Ok(file) = File::open(&tailed.path) else {
         return ReadResult::OpenFailed;
     };
@@ -355,7 +357,7 @@ fn check_and_read(tailed: &mut TailedFile, sink: &Sink) -> ReadResult {
         // Can't find old file — accept the loss, switch to new file
         tailed.id = current_id;
         tailed.pos = 0;
-        let bytes = read_lines(file, tailed, sink);
+        let bytes = read_lines(file, tailed, sink, parse_syslog);
         return if bytes > 0 {
             ReadResult::Bytes(bytes)
         } else {
@@ -375,7 +377,7 @@ fn check_and_read(tailed: &mut TailedFile, sink: &Sink) -> ReadResult {
         return ReadResult::Idle;
     }
 
-    let bytes_read = read_lines(file, tailed, sink);
+    let bytes_read = read_lines(file, tailed, sink, parse_syslog);
     if bytes_read > 0 {
         ReadResult::Bytes(bytes_read)
     } else {
@@ -434,7 +436,7 @@ pub(crate) fn find_rotated_file(tailed: &TailedFile) -> Option<File> {
 }
 
 /// Drain remaining lines from a retained fd (old file after rotation).
-pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink) -> u64 {
+pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, parse_syslog: bool) -> u64 {
     let Some(file) = tailed.retained_fd.take() else {
         return 0;
     };
@@ -443,12 +445,6 @@ pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink) -> u64 {
     if reader.seek(SeekFrom::Start(tailed.pos)).is_err() {
         return 0;
     }
-
-    let filename = tailed
-        .path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("unknown");
 
     let mut bytes_read = 0u64;
     let mut buf = Vec::new();
@@ -462,7 +458,12 @@ pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink) -> u64 {
                 bytes_read += n as u64;
 
                 if buf.last() == Some(&b'\n') {
-                    emit_line(&buf[..buf.len() - 1], &mut tailed.partial, filename, sink);
+                    emit_line(
+                        &buf[..buf.len() - 1],
+                        &mut tailed.partial,
+                        sink,
+                        parse_syslog,
+                    );
                 } else {
                     tailed.partial.push_str(&String::from_utf8_lossy(&buf));
                 }
@@ -488,17 +489,16 @@ pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink) -> u64 {
 /// **without advancing the file offset**. The unread lines stay in the file
 /// and will be picked up on the next poll. This makes the filesystem the
 /// natural overflow buffer — zero blocking, zero data loss.
-pub(crate) fn read_lines(file: File, tailed: &mut TailedFile, sink: &Sink) -> u64 {
+pub(crate) fn read_lines(
+    file: File,
+    tailed: &mut TailedFile,
+    sink: &Sink,
+    parse_syslog: bool,
+) -> u64 {
     let mut reader = BufReader::new(file);
     if reader.seek(SeekFrom::Start(tailed.pos)).is_err() {
         return 0;
     }
-
-    let filename = tailed
-        .path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("unknown");
 
     let mut bytes_read = 0u64;
     let mut lines_emitted = 0usize;
@@ -510,7 +510,12 @@ pub(crate) fn read_lines(file: File, tailed: &mut TailedFile, sink: &Sink) -> u6
             Ok(0) => break,
             Ok(n) => {
                 if buf.last() == Some(&b'\n') {
-                    if !try_emit_line(&buf[..buf.len() - 1], &mut tailed.partial, filename, sink) {
+                    if !try_emit_line(
+                        &buf[..buf.len() - 1],
+                        &mut tailed.partial,
+                        sink,
+                        parse_syslog,
+                    ) {
                         // Channel full — don't advance offset, retry next poll.
                         break;
                     }
@@ -546,8 +551,8 @@ pub(crate) fn read_lines(file: File, tailed: &mut TailedFile, sink: &Sink) -> u6
 pub(crate) fn try_emit_line(
     line_bytes: &[u8],
     partial: &mut String,
-    filename: &str,
     sink: &Sink,
+    parse_syslog: bool,
 ) -> bool {
     let line_lossy = String::from_utf8_lossy(line_bytes);
 
@@ -566,7 +571,23 @@ pub(crate) fn try_emit_line(
         return true;
     }
 
-    if sink.try_log(tell::LogLevel::Info, trimmed, Some(filename), None::<()>) {
+    let ok = if parse_syslog {
+        if let Some(parsed) = super::syslog::parse(trimmed) {
+            sink.try_log_with_service(
+                tell::LogLevel::Info,
+                parsed.body,
+                None,
+                Some(parsed.program),
+                None::<()>,
+            )
+        } else {
+            sink.try_log(tell::LogLevel::Info, trimmed, None, None::<()>)
+        }
+    } else {
+        sink.try_log(tell::LogLevel::Info, trimmed, None, None::<()>)
+    };
+
+    if ok {
         partial.clear();
         true
     } else {
@@ -577,7 +598,7 @@ pub(crate) fn try_emit_line(
 }
 
 /// Emit a complete line, prepending any buffered partial. Fire-and-forget.
-pub(crate) fn emit_line(line_bytes: &[u8], partial: &mut String, filename: &str, sink: &Sink) {
+pub(crate) fn emit_line(line_bytes: &[u8], partial: &mut String, sink: &Sink, parse_syslog: bool) {
     let line_str = if partial.is_empty() {
         String::from_utf8_lossy(line_bytes)
     } else {
@@ -588,7 +609,19 @@ pub(crate) fn emit_line(line_bytes: &[u8], partial: &mut String, filename: &str,
 
     let trimmed = line_str.trim_end();
     if !trimmed.is_empty() {
-        sink.log(tell::LogLevel::Info, trimmed, Some(filename), None::<()>);
+        if parse_syslog {
+            if let Some(parsed) = super::syslog::parse(trimmed) {
+                sink.log_with_service(
+                    tell::LogLevel::Info,
+                    parsed.body,
+                    None,
+                    Some(parsed.program),
+                    None::<()>,
+                );
+                return;
+            }
+        }
+        sink.log(tell::LogLevel::Info, trimmed, None, None::<()>);
     }
 }
 
@@ -598,16 +631,10 @@ pub(crate) fn flush_partial(tailed: &mut TailedFile, sink: &Sink) {
         return;
     }
 
-    let filename = tailed
-        .path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("unknown");
-
     let line = std::mem::take(&mut tailed.partial);
     let trimmed = line.trim();
     if !trimmed.is_empty() {
-        sink.log(tell::LogLevel::Info, trimmed, Some(filename), None::<()>);
+        sink.log(tell::LogLevel::Info, trimmed, None, None::<()>);
     }
 }
 

@@ -8,9 +8,16 @@
 //! - Periodic glob re-scan to discover new log files
 //! - Log rotation detection (inode tracking + truncation detection)
 
+pub mod journal;
+pub mod syslog;
 pub mod watcher;
 
+pub use journal::tail_journal;
 pub use watcher::tail_files;
 
+#[cfg(test)]
+mod journal_test;
+#[cfg(test)]
+mod syslog_test;
 #[cfg(test)]
 mod watcher_test;

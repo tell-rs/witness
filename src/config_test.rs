@@ -1,4 +1,4 @@
-use crate::config::{AgentConfig, DeviceFilter, FilterConfig};
+use crate::config::{AgentConfig, DeviceFilter, FilterConfig, LogSource};
 use std::time::Duration;
 
 // --- TOML parsing ---
@@ -16,6 +16,7 @@ fn minimal_config() {
     assert_eq!(cfg.interval, Duration::from_secs(15));
     assert!(cfg.tags.is_empty());
     assert!(!cfg.logs.is_empty(), "should have default log paths");
+    assert!(cfg.parse_syslog);
     assert!(cfg.system.cpu);
     assert!(cfg.system.memory);
     assert!(cfg.system.load);
@@ -60,6 +61,67 @@ network = true
 fn missing_api_key_fails() {
     let result: Result<AgentConfig, _> = toml::from_str(r#"endpoint = "localhost:50000""#);
     assert!(result.is_err());
+}
+
+#[test]
+fn parse_syslog_default_true() {
+    let cfg = parse(r#"api_key = "aaaa1111bbbb2222cccc3333dddd4444""#);
+    assert!(cfg.parse_syslog);
+}
+
+#[test]
+fn parse_syslog_explicit_false() {
+    let cfg = parse(
+        r#"
+api_key = "aaaa1111bbbb2222cccc3333dddd4444"
+parse_syslog = false
+"#,
+    );
+    assert!(!cfg.parse_syslog);
+}
+
+// --- LogSource ---
+
+#[test]
+fn log_source_default_auto() {
+    let cfg = parse(r#"api_key = "aaaa1111bbbb2222cccc3333dddd4444""#);
+    assert_eq!(cfg.log_source, LogSource::Auto);
+}
+
+#[test]
+fn log_source_journald() {
+    let cfg = parse(
+        r#"
+api_key = "aaaa1111bbbb2222cccc3333dddd4444"
+log_source = "journald"
+"#,
+    );
+    assert_eq!(cfg.log_source, LogSource::Journald);
+}
+
+#[test]
+fn log_source_files() {
+    let cfg = parse(
+        r#"
+api_key = "aaaa1111bbbb2222cccc3333dddd4444"
+log_source = "files"
+"#,
+    );
+    assert_eq!(cfg.log_source, LogSource::Files);
+}
+
+#[test]
+fn log_source_invalid_fails() {
+    let result: Result<AgentConfig, _> = toml::from_str(
+        r#"
+api_key = "aaaa1111bbbb2222cccc3333dddd4444"
+log_source = "journal"
+"#,
+    );
+    assert!(
+        result.is_err(),
+        "typo 'journal' should fail, not silently become auto"
+    );
 }
 
 // --- Duration parsing ---

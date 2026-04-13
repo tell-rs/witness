@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.2.0
+
+New:
+- logs: journald backend with structured service name, severity, and cursor-based resume
+- logs: syslog parser extracts service name from RFC 3164 and ISO 8601 lines
+- config: log_source selects journald, files, or auto-detect — setup picks based on the system
+- setup: --offline flag skips auto-config fetch
+
+Fix:
+- logs: source field carries hostname instead of filename
+- sink: log message truncation safe on multi-byte UTF-8
+- setup: silent fallback when server is unreachable
+
 ## v0.1.4
 
 New:

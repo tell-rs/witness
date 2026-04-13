@@ -79,6 +79,10 @@ pub struct InstallArgs {
     #[arg(long)]
     pub endpoint: Option<String>,
 
+    /// Skip auto-config fetch, generate config locally
+    #[arg(long)]
+    pub offline: bool,
+
     /// Overwrite existing config and service files
     #[arg(long)]
     pub force: bool,
@@ -116,6 +120,7 @@ fn execute(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
             token,
             server: args.server,
             endpoint: args.endpoint,
+            offline: args.offline,
             config: PathBuf::from(CONFIG_FILE),
             force: args.force,
         };

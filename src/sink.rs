@@ -232,11 +232,7 @@ impl Sink {
             SinkInner::DryRun(dr) => {
                 dr.counter.fetch_add(1, Ordering::Relaxed);
                 let comp = component.unwrap_or("-");
-                let msg = if message.len() > 120 {
-                    &message[..120]
-                } else {
-                    message
-                };
+                let msg = &message[..message.floor_char_boundary(120)];
                 eprintln!("  log     [{comp}] {msg}");
             }
             SinkInner::Discard => {}
@@ -258,11 +254,7 @@ impl Sink {
             SinkInner::DryRun(dr) => {
                 dr.counter.fetch_add(1, Ordering::Relaxed);
                 let comp = component.unwrap_or("-");
-                let msg = if message.len() > 120 {
-                    &message[..120]
-                } else {
-                    message
-                };
+                let msg = &message[..message.floor_char_boundary(120)];
                 eprintln!("  log     [{comp}] {msg}");
                 true
             }
@@ -270,6 +262,44 @@ impl Sink {
             #[cfg(test)]
             SinkInner::Full => false,
         }
+    }
+
+    /// Try to send a log entry with per-entry service override.
+    pub fn try_log_with_service(
+        &self,
+        level: LogLevel,
+        message: &str,
+        component: Option<&str>,
+        service: Option<&str>,
+        data: impl tell::IntoPayload,
+    ) -> bool {
+        match &self.inner {
+            SinkInner::Live(tell) => {
+                tell.try_log_with_service(level, message, component, service, data)
+            }
+            SinkInner::DryRun(dr) => {
+                dr.counter.fetch_add(1, Ordering::Relaxed);
+                let svc = service.unwrap_or("-");
+                let msg = &message[..message.floor_char_boundary(120)];
+                eprintln!("  log     [{svc}] {msg}");
+                true
+            }
+            SinkInner::Discard => true,
+            #[cfg(test)]
+            SinkInner::Full => false,
+        }
+    }
+
+    /// Fire-and-forget variant of [`try_log_with_service`].
+    pub fn log_with_service(
+        &self,
+        level: LogLevel,
+        message: &str,
+        component: Option<&str>,
+        service: Option<&str>,
+        data: impl tell::IntoPayload,
+    ) {
+        let _ = self.try_log_with_service(level, message, component, service, data);
     }
 
     // --- Lifecycle ---

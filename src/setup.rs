@@ -28,6 +28,10 @@ pub struct SetupArgs {
     #[arg(short, long, default_value = "/etc/witness/config.toml")]
     pub config: PathBuf,
 
+    /// Skip auto-config fetch, generate config locally
+    #[arg(long)]
+    pub offline: bool,
+
     /// Overwrite existing config file
     #[arg(long)]
     pub force: bool,
@@ -56,16 +60,20 @@ fn execute(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Try to fetch config from the Tell server
-    let config_toml = match fetch_config(&args.server, &args.token) {
-        Ok(toml) => {
-            eprintln!("fetched config from {}", args.server);
-            toml
-        }
-        Err(e) => {
-            eprintln!("could not reach server ({e}), using defaults");
-            let endpoint = args.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT);
-            generate_default(&args.token, endpoint)
+    let endpoint = args.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT);
+
+    let config_toml = if args.offline {
+        generate_default(&args.token, endpoint)
+    } else {
+        match fetch_config(&args.server, &args.token) {
+            Ok(toml) => {
+                eprintln!("fetched config from {}", args.server);
+                toml
+            }
+            Err(_) => {
+                eprintln!("using local defaults");
+                generate_default(&args.token, endpoint)
+            }
         }
     };
 
@@ -147,14 +155,28 @@ fn fetch_config(server: &str, token: &str) -> Result<String, Box<dyn std::error:
 }
 
 fn generate_default(api_key: &str, endpoint: &str) -> String {
-    format!(
-        r#"api_key = "{api_key}"
+    if crate::logs::journal::is_available() {
+        format!(
+            r#"api_key = "{api_key}"
 endpoint = "{endpoint}"
+
+# Log ingestion: "journald", "files", or "auto"
+log_source = "journald"
+"#
+        )
+    } else {
+        format!(
+            r#"api_key = "{api_key}"
+endpoint = "{endpoint}"
+
+# Log ingestion: "journald", "files", or "auto"
+log_source = "files"
 
 logs = [
     "/var/log/syslog",
     "/var/log/auth.log",
 ]
 "#
-    )
+        )
+    }
 }

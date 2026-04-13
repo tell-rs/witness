@@ -8,6 +8,9 @@ api_key = "feed1e11feed1e11feed1e11feed1e11"
 # Collector endpoint (default: localhost:50000)
 # endpoint = "localhost:50000"
 
+# Tell server URL for auto-config. Omit to disable.
+# server = "https://tell.rs"
+
 # Hostname override (auto-detected if omitted)
 # hostname = "my-server"
 
@@ -20,12 +23,14 @@ api_key = "feed1e11feed1e11feed1e11feed1e11"
 # Maximum disk buffer size in bytes (default: 3 GiB)
 # buffer_max_bytes = 3221225472
 
-# Log files to tail (glob patterns supported)
-# Platform-aware defaults are used when omitted:
-#   Linux: syslog, auth, nginx, postgres, mysql, mongodb, redis, haproxy, etc.
-#   macOS: /var/log/system.log
-# Set to [] to disable. Override to add your own:
+# Log source: "auto", "journald", or "files" (default: auto).
+# auto uses journald when available, falls back to file tailing.
+# log_source = "auto"
+
+# File tailing settings (only apply when log_source is "files" or fallback).
+# Log paths default per platform if omitted. Set to [] to disable.
 # logs = ["/var/log/myapp/*.log"]
+# parse_syslog = true
 
 # Global tags — applied to all metrics and logs
 # [tags]
