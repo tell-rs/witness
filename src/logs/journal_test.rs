@@ -94,11 +94,76 @@ fn test_process_entry_default_priority() {
 fn test_process_entry_ignores_unknown_fields() {
     let dr = DryRun::new();
     let sink = Sink::dry_run(dr.clone(), Default::default());
-    // Extra fields like _SYSTEMD_UNIT are silently ignored
+    // systemd-trusted fields (_*) land in extras but are filtered
+    // out of the outgoing payload by app_fields_payload.
     let json = r#"{"MESSAGE":"started","SYSLOG_IDENTIFIER":"nginx","_SYSTEMD_UNIT":"nginx.service","_PID":"123","__CURSOR":"s=z"}"#;
     let result = journal::process_entry(json, &sink);
     assert_eq!(result, Some(Some("s=z".to_string())));
     assert_eq!(dr.count(), 1);
+}
+
+// --- app_fields_payload ---
+
+#[test]
+fn test_app_fields_empty_returns_none() {
+    let extras = std::collections::HashMap::new();
+    assert!(journal::app_fields_payload(extras).is_none());
+}
+
+#[test]
+fn test_app_fields_filters_systemd_trusted() {
+    // Only _*-prefixed fields present — all should be filtered.
+    let extras: std::collections::HashMap<String, serde_json::Value> = [
+        ("_PID".to_string(), serde_json::json!("123")),
+        (
+            "_SYSTEMD_UNIT".to_string(),
+            serde_json::json!("foo.service"),
+        ),
+        ("__REALTIME_TIMESTAMP".to_string(), serde_json::json!("1")),
+    ]
+    .into_iter()
+    .collect();
+    assert!(journal::app_fields_payload(extras).is_none());
+}
+
+#[test]
+fn test_app_fields_lowercases_app_keys() {
+    let extras: std::collections::HashMap<String, serde_json::Value> = [
+        ("IP".to_string(), serde_json::json!("1.2.3.4")),
+        ("JAIL".to_string(), serde_json::json!("sshd")),
+        ("BAN_TIME".to_string(), serde_json::json!("3600")),
+        ("_PID".to_string(), serde_json::json!("42")), // should drop
+    ]
+    .into_iter()
+    .collect();
+
+    let payload = journal::app_fields_payload(extras).expect("has app fields");
+    let obj = payload.as_object().expect("object");
+
+    assert_eq!(obj.len(), 3);
+    assert_eq!(obj.get("ip"), Some(&serde_json::json!("1.2.3.4")));
+    assert_eq!(obj.get("jail"), Some(&serde_json::json!("sshd")));
+    assert_eq!(obj.get("ban_time"), Some(&serde_json::json!("3600")));
+    assert!(!obj.contains_key("IP"));
+    assert!(!obj.contains_key("_pid"));
+    assert!(!obj.contains_key("_PID"));
+}
+
+#[test]
+fn test_app_fields_preserves_non_string_values() {
+    // journalctl -o json sometimes emits arrays (for binary values) —
+    // serde_json::Value round-trips whatever shape the source provided.
+    let extras: std::collections::HashMap<String, serde_json::Value> = [
+        ("COUNT".to_string(), serde_json::json!(42)),
+        ("FLAGS".to_string(), serde_json::json!([1, 2, 3])),
+    ]
+    .into_iter()
+    .collect();
+
+    let payload = journal::app_fields_payload(extras).expect("has app fields");
+    let obj = payload.as_object().expect("object");
+    assert_eq!(obj.get("count"), Some(&serde_json::json!(42)));
+    assert_eq!(obj.get("flags"), Some(&serde_json::json!([1, 2, 3])));
 }
 
 #[test]

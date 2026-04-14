@@ -5,6 +5,7 @@
 //! name, and clean message body. Cursor-based checkpointing for restart recovery.
 //! Auto-restarts with exponential backoff if journalctl exits unexpectedly.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -31,8 +32,13 @@ const SELF_IDENTIFIER: &str = "witness";
 
 // ─── Types ─────────────��────────────────────────────────────────────
 
-/// Structured journal entry — only the fields we need.
-/// Unknown fields are silently skipped by serde.
+/// Structured journal entry.
+///
+/// Named fields map the five well-known keys we handle specially; anything
+/// else the application emits (e.g. tracing-structured fields like `IP`,
+/// `JAIL`, `REASON`) lands in `extras` and is forwarded to Tell as a
+/// structured log payload. systemd-trusted (`_*`) and journal-internal
+/// (`__*`) fields are filtered out downstream.
 #[derive(Deserialize)]
 struct JournalEntry {
     #[serde(rename = "MESSAGE", default)]
@@ -45,6 +51,8 @@ struct JournalEntry {
     priority: Option<String>,
     #[serde(rename = "__CURSOR", default)]
     cursor: Option<String>,
+    #[serde(flatten)]
+    extras: HashMap<String, serde_json::Value>,
 }
 
 enum LoopExit {
@@ -241,9 +249,33 @@ pub(crate) fn process_entry(json_line: &str, sink: &Sink) -> Option<Option<Strin
         .and_then(priority_to_level)
         .unwrap_or(tell::LogLevel::Info);
 
-    sink.log_with_service(level, message, None, Some(program), None::<()>);
+    let payload = app_fields_payload(entry.extras);
+    sink.log_with_service(level, message, None, Some(program), payload);
 
     Some(cursor)
+}
+
+/// Convert the flattened extras into a structured log payload.
+///
+/// Filters systemd-trusted (`_*`) and journal-internal (`__*`) fields,
+/// keeping only application-emitted ones (uppercase-by-journald-convention).
+/// Keys are lowercased so ClickHouse queries match the logfmt keys in MESSAGE
+/// — `JSONExtractString(message, 'jail')` reads the same way operators write
+/// `jail=sshd` in logs. Returns `None` when nothing is left after filtering
+/// so we preserve the existing `None::<()>` wire shape for untagged entries.
+pub fn app_fields_payload(extras: HashMap<String, serde_json::Value>) -> Option<serde_json::Value> {
+    let mut obj = serde_json::Map::with_capacity(extras.len());
+    for (k, v) in extras {
+        if k.starts_with('_') {
+            continue;
+        }
+        obj.insert(k.to_lowercase(), v);
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(obj))
+    }
 }
 
 /// Map syslog PRIORITY string (0-7) to Tell LogLevel.

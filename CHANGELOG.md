@@ -5,6 +5,7 @@
 New:
 - logs: journald backend with structured service name, severity, and cursor-based resume
 - logs: syslog parser extracts service name from RFC 3164 and ISO 8601 lines
+- logs: application-emitted journald fields forwarded as structured log properties, with systemd-trusted fields filtered out
 - config: log_source selects journald, files, or auto-detect — setup picks based on the system
 - setup: --offline flag skips auto-config fetch
 
