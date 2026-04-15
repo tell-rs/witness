@@ -249,10 +249,178 @@ pub(crate) fn process_entry(json_line: &str, sink: &Sink) -> Option<Option<Strin
         .and_then(priority_to_level)
         .unwrap_or(tell::LogLevel::Info);
 
-    let payload = app_fields_payload(entry.extras);
-    sink.log_with_service(level, message, None, Some(program), payload);
+    // Parse structured content out of MESSAGE itself (logfmt or JSON).
+    // Apps that write their whole payload into MESSAGE (e.g. fail2ban-rs)
+    // give us the event phrase plus key=value fields there.
+    let (body, parsed_fields) = split_message(message);
+
+    // Merge: journald metadata (for daemons that use it) + parsed MESSAGE
+    // fields (for daemons that put everything in the text payload). In
+    // either direction the result is one flat structured payload.
+    let payload = merge_payloads(entry.extras, parsed_fields);
+
+    sink.log_with_service(level, &body, None, Some(program), payload);
 
     Some(cursor)
+}
+
+/// Extract the event phrase (body) and structured fields from MESSAGE.
+///
+/// Detects JSON if the text starts with `{`; otherwise tries logfmt. On
+/// any parse failure, returns the full MESSAGE as body with no fields —
+/// witness stays a forwarder, never drops data.
+///
+/// Body is borrowed when possible (logfmt slice) and owned when not
+/// (JSON value extracted from a parsed object).
+pub fn split_message(message: &str) -> (std::borrow::Cow<'_, str>, Option<serde_json::Value>) {
+    use std::borrow::Cow;
+
+    let trimmed = message.trim_start();
+    if trimmed.starts_with('{') {
+        if let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str(trimmed) {
+            let body = obj
+                .remove("msg")
+                .or_else(|| obj.remove("message"))
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                })
+                .map_or(Cow::Borrowed(message), Cow::Owned);
+            let fields = if obj.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(obj))
+            };
+            return (body, fields);
+        }
+    }
+
+    if let Some(split_at) = logfmt_field_start(message) {
+        let body = &message[..split_at];
+        let rest = &message[split_at + 1..];
+        let fields = parse_logfmt_fields(rest);
+        let fields_v = if fields.is_empty() {
+            None
+        } else {
+            let obj: serde_json::Map<String, serde_json::Value> = fields
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            Some(serde_json::Value::Object(obj))
+        };
+        return (Cow::Borrowed(body), fields_v);
+    }
+
+    (Cow::Borrowed(message), None)
+}
+
+/// Scan for the byte offset of the space preceding the first `key=value`
+/// token. Returns `None` if no logfmt-shaped tail is present.
+fn logfmt_field_start(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b' ' {
+            // Look ahead for `<ident>=` at bytes[i+1..]
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && is_logfmt_key_byte(bytes[j]) {
+                j += 1;
+            }
+            if j > start && j < bytes.len() && bytes[j] == b'=' {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_logfmt_key_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'
+}
+
+/// Parse a logfmt tail (the part after the event phrase) into key/value pairs.
+fn parse_logfmt_fields(s: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip whitespace.
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // Read key.
+        let key_start = i;
+        while i < bytes.len() && is_logfmt_key_byte(bytes[i]) {
+            i += 1;
+        }
+        if i == key_start || i >= bytes.len() || bytes[i] != b'=' {
+            // Malformed — skip to next space.
+            while i < bytes.len() && bytes[i] != b' ' {
+                i += 1;
+            }
+            continue;
+        }
+        let key = s[key_start..i].to_string();
+        i += 1; // past '='
+        // Read value: quoted or bare.
+        let value = if i < bytes.len() && bytes[i] == b'"' {
+            i += 1;
+            let mut v = String::new();
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    match bytes[i + 1] {
+                        b'"' => v.push('"'),
+                        b'\\' => v.push('\\'),
+                        b'n' => v.push('\n'),
+                        other => {
+                            v.push('\\');
+                            v.push(other as char);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    v.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            i += 1; // past closing '"'
+            v
+        } else {
+            let v_start = i;
+            while i < bytes.len() && bytes[i] != b' ' {
+                i += 1;
+            }
+            s[v_start..i].to_string()
+        };
+        out.push((key, value));
+    }
+    out
+}
+
+/// Combine journald metadata fields with fields parsed from MESSAGE.
+/// Parsed-MESSAGE fields win on key collisions — they're the app's voice.
+fn merge_payloads(
+    extras: HashMap<String, serde_json::Value>,
+    parsed: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let metadata = app_fields_payload(extras);
+    match (metadata, parsed) {
+        (None, None) => None,
+        (Some(m), None) => Some(m),
+        (None, Some(p)) => Some(p),
+        (Some(serde_json::Value::Object(mut m)), Some(serde_json::Value::Object(p))) => {
+            for (k, v) in p {
+                m.insert(k, v);
+            }
+            Some(serde_json::Value::Object(m))
+        }
+        (Some(m), Some(_)) => Some(m),
+    }
 }
 
 /// Convert the flattened extras into a structured log payload.

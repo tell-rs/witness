@@ -149,6 +149,73 @@ fn test_app_fields_lowercases_app_keys() {
     assert!(!obj.contains_key("_PID"));
 }
 
+// --- split_message ---
+
+#[test]
+fn test_split_message_json() {
+    let msg = r#"{"msg":"banned","ip":"1.2.3.4","jail":"sshd","ban_count":1}"#;
+    let (body, fields) = journal::split_message(msg);
+    assert_eq!(body, "banned");
+    let obj = fields.expect("fields").as_object().expect("object").clone();
+    assert_eq!(obj.get("ip"), Some(&serde_json::json!("1.2.3.4")));
+    assert_eq!(obj.get("jail"), Some(&serde_json::json!("sshd")));
+    assert_eq!(obj.get("ban_count"), Some(&serde_json::json!(1)));
+    assert!(!obj.contains_key("msg"));
+}
+
+#[test]
+fn test_split_message_logfmt() {
+    let msg = "banned ip=1.2.3.4 jail=sshd ban_time=3600 reason=threshold";
+    let (body, fields) = journal::split_message(msg);
+    assert_eq!(body, "banned");
+    let obj = fields.expect("fields").as_object().expect("object").clone();
+    assert_eq!(obj.get("ip"), Some(&serde_json::json!("1.2.3.4")));
+    assert_eq!(obj.get("jail"), Some(&serde_json::json!("sshd")));
+    assert_eq!(obj.get("ban_time"), Some(&serde_json::json!("3600")));
+    assert_eq!(obj.get("reason"), Some(&serde_json::json!("threshold")));
+}
+
+#[test]
+fn test_split_message_logfmt_multi_word_phrase() {
+    let msg = "ban failed ip=1.2.3.4 jail=sshd";
+    let (body, fields) = journal::split_message(msg);
+    assert_eq!(body, "ban failed");
+    let obj = fields.expect("fields").as_object().expect("object").clone();
+    assert_eq!(obj.get("ip"), Some(&serde_json::json!("1.2.3.4")));
+    assert_eq!(obj.get("jail"), Some(&serde_json::json!("sshd")));
+}
+
+#[test]
+fn test_split_message_logfmt_quoted_values() {
+    let msg = r#"ban failed ip=1.2.3.4 error="nft command failed""#;
+    let (body, fields) = journal::split_message(msg);
+    assert_eq!(body, "ban failed");
+    let obj = fields.expect("fields").as_object().expect("object").clone();
+    assert_eq!(obj.get("ip"), Some(&serde_json::json!("1.2.3.4")));
+    assert_eq!(
+        obj.get("error"),
+        Some(&serde_json::json!("nft command failed"))
+    );
+}
+
+#[test]
+fn test_split_message_plain_text() {
+    // No structured content — return the whole string as body.
+    let msg = "connection accepted from remote host";
+    let (body, fields) = journal::split_message(msg);
+    assert_eq!(body, "connection accepted from remote host");
+    assert!(fields.is_none());
+}
+
+#[test]
+fn test_split_message_malformed_json() {
+    // Starts with `{` but isn't valid JSON — fall back to logfmt detection.
+    let msg = "{not valid json";
+    let (body, fields) = journal::split_message(msg);
+    assert_eq!(body, "{not valid json");
+    assert!(fields.is_none());
+}
+
 #[test]
 fn test_app_fields_preserves_non_string_values() {
     // journalctl -o json sometimes emits arrays (for binary values) —

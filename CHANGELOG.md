@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.1
+
+- logs: structured fields extracted from logfmt and JSON payloads inside log messages
+
 ## v0.2.0
 
 New:
