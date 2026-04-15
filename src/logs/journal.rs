@@ -431,10 +431,21 @@ fn merge_payloads(
 /// — `JSONExtractString(message, 'jail')` reads the same way operators write
 /// `jail=sshd` in logs. Returns `None` when nothing is left after filtering
 /// so we preserve the existing `None::<()>` wire shape for untagged entries.
+/// Systemd/libsystemd-emitted fields that carry no structured value for
+/// Tell. Kept out of the forwarded payload so they don't pollute queries.
+///
+/// - `SYSLOG_FACILITY`: derived from PRIORITY, already encoded as level.
+/// - `SYSLOG_PID`: duplicate of `_PID` (already filtered by the `_*` rule).
+/// - `SYSLOG_RAW`: pre-parsed syslog line; everything in it is broken out.
+///
+/// `MESSAGE_ID` and `CODE_FILE`/`CODE_FUNCTION`/`CODE_LINE` are kept —
+/// they're opt-in event/location identifiers apps choose to emit.
+const SYSTEMD_META_DENYLIST: &[&str] = &["SYSLOG_FACILITY", "SYSLOG_PID", "SYSLOG_RAW"];
+
 pub fn app_fields_payload(extras: HashMap<String, serde_json::Value>) -> Option<serde_json::Value> {
     let mut obj = serde_json::Map::with_capacity(extras.len());
     for (k, v) in extras {
-        if k.starts_with('_') {
+        if k.starts_with('_') || SYSTEMD_META_DENYLIST.contains(&k.as_str()) {
             continue;
         }
         obj.insert(k.to_lowercase(), v);

@@ -149,6 +149,36 @@ fn test_app_fields_lowercases_app_keys() {
     assert!(!obj.contains_key("_PID"));
 }
 
+#[test]
+fn test_app_fields_filters_systemd_metadata_denylist() {
+    // SYSLOG_FACILITY/PID/RAW are systemd-emitted and carry no structured
+    // value beyond what PRIORITY/service already cover. Stay out of Tell.
+    let extras: std::collections::HashMap<String, serde_json::Value> = [
+        ("IP".to_string(), serde_json::json!("1.2.3.4")),
+        ("SYSLOG_FACILITY".to_string(), serde_json::json!("3")),
+        ("SYSLOG_PID".to_string(), serde_json::json!("12345")),
+        ("SYSLOG_RAW".to_string(), serde_json::json!("<5>raw line")),
+        // These are intentionally kept.
+        (
+            "MESSAGE_ID".to_string(),
+            serde_json::json!("8d45620c1a4348dbb17410da57c60c66"),
+        ),
+        ("CODE_FILE".to_string(), serde_json::json!("src/main.rs")),
+    ]
+    .into_iter()
+    .collect();
+
+    let payload = journal::app_fields_payload(extras).expect("has app fields");
+    let obj = payload.as_object().expect("object");
+
+    assert!(obj.contains_key("ip"));
+    assert!(obj.contains_key("message_id"));
+    assert!(obj.contains_key("code_file"));
+    assert!(!obj.contains_key("syslog_facility"));
+    assert!(!obj.contains_key("syslog_pid"));
+    assert!(!obj.contains_key("syslog_raw"));
+}
+
 // --- split_message ---
 
 #[test]

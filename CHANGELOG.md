@@ -1,12 +1,10 @@
 # Changelog
 
-## v0.2.1
-
-- logs: structured fields extracted from logfmt and JSON payloads inside log messages
-
 ## v0.2.0
 
 New:
+- logs: structured fields extracted from logfmt and JSON payloads inside log messages
+- logs: noisy SYSLOG_FACILITY, SYSLOG_PID, and SYSLOG_RAW journal fields filtered from forwarded properties
 - logs: journald backend with structured service name, severity, and cursor-based resume
 - logs: syslog parser extracts service name from RFC 3164 and ISO 8601 lines
 - logs: application-emitted journald fields forwarded as structured log properties, with systemd-trusted fields filtered out

@@ -22,6 +22,8 @@
 - Journald self-filtering — witness's own log entries are excluded to prevent feedback loops.
 - Syslog parsing — extracts service name (sshd, kernel, CRON, etc.) from RFC 3164 and ISO 8601 syslog lines.
 - Per-entry service name — both journald and syslog-parsed file logs set the Tell protocol `service` field per line.
+- Structured journald properties — application-emitted journald fields are forwarded as structured log properties, with systemd-internal fields (`_*`, `SYSLOG_FACILITY`, `SYSLOG_PID`, `SYSLOG_RAW`) filtered out.
+- Inline payload parsing — logfmt (`key=value`) and embedded JSON inside log messages are extracted into structured fields alongside journald properties.
 - Polling-based file tailing — 250ms base poll with adaptive backoff to 2s when idle, 50ms fast catchup under load.
 - Glob pattern discovery — paths like `/var/log/nginx/*.log` re-scanned every 10 seconds for new files.
 - Rotation handling — rename (logrotate) and copytruncate both supported, old file descriptors retained and drained to EOF.
