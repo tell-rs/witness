@@ -1,18 +1,16 @@
-mod config;
 mod install;
-mod logs;
-mod metrics;
 mod setup;
-mod sink;
 
 use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
 use tell::{Tell, TellConfig};
+use tracing::{error, info, warn};
 
-use crate::config::{LogSource, load_config, resolve_hostname, state_dir};
-use crate::sink::{DryRun, Sink};
+use witness::config::{AgentConfig, LogSource, load_config, resolve_hostname, state_dir};
+use witness::sink::{DryRun, Sink};
+use witness::{config, logs, metrics};
 
 #[derive(Parser)]
 #[command(name = "witness", about = "Witness host monitoring agent")]
@@ -57,18 +55,51 @@ async fn main() {
         return;
     }
 
+    init_tracing();
+
+    // A missing/invalid config is fatal only at startup. After that, a bad
+    // reload keeps the last good config — an agent must not die because an
+    // operator fat-fingered a TOML edit and sent SIGHUP.
+    let mut cfg = match load_config(&cli.config) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(path = %cli.config.display(), "failed to load config: {e}");
+            process::exit(1);
+        }
+    };
+
     // Outer loop: SIGHUP restarts with new config, zero data loss.
     loop {
-        match run(&cli.config).await {
+        match run(cfg.clone()).await {
             RunResult::Shutdown => {
-                eprintln!("witness stopped");
+                info!("witness stopped");
                 return;
             }
-            RunResult::Reload => {
-                eprintln!("reloading config...");
-            }
+            RunResult::Reload => match load_config(&cli.config) {
+                Ok(c) => {
+                    info!("config reloaded");
+                    cfg = c;
+                }
+                Err(e) => {
+                    error!(
+                        path = %cli.config.display(),
+                        "reload failed, keeping previous config: {e}"
+                    );
+                }
+            },
         }
     }
+}
+
+/// Structured logging to stderr, filtered via `RUST_LOG` (default `info`).
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 // ---------------------------------------------------------------------------
@@ -218,15 +249,7 @@ enum RunResult {
     Reload,
 }
 
-async fn run(config_path: &PathBuf) -> RunResult {
-    let cfg = match load_config(config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("failed to load config from {}: {e}", config_path.display());
-            process::exit(1);
-        }
-    };
-
+async fn run(cfg: AgentConfig) -> RunResult {
     let hostname = resolve_hostname(&cfg.hostname);
     let interval = cfg.interval;
 
@@ -234,12 +257,10 @@ async fn run(config_path: &PathBuf) -> RunResult {
     match std::fs::create_dir_all(&buffer_dir) {
         Ok(()) => {}
         Err(e) => {
-            eprintln!(
-                "WARNING: cannot create disk buffer at {}: {e}",
-                buffer_dir.display()
-            );
-            eprintln!(
-                "WARNING: data WILL BE LOST on network failures — fix permissions or run as root"
+            warn!(
+                path = %buffer_dir.display(),
+                "cannot create disk buffer: {e} — data WILL BE LOST on network \
+                 failures; fix permissions or run as root"
             );
         }
     }
@@ -259,7 +280,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
     let tell_config = match builder.build() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("invalid config: {e}");
+            error!("invalid config: {e}");
             process::exit(1);
         }
     };
@@ -267,14 +288,14 @@ async fn run(config_path: &PathBuf) -> RunResult {
     let client = match Tell::new(tell_config) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("failed to init client: {e}");
+            error!("failed to init client: {e}");
             process::exit(1);
         }
     };
 
     let sink = Sink::live(client, cfg.tags);
 
-    eprintln!("witness starting (host={hostname}, interval={interval:?})");
+    info!(host = %hostname, ?interval, "witness starting");
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
@@ -287,17 +308,17 @@ async fn run(config_path: &PathBuf) -> RunResult {
         Some(tokio::spawn(async move {
             let mut collectors = metrics::init_collectors(&system_config);
             if collectors.is_empty() {
-                eprintln!("no collectors available for this platform");
+                warn!("no collectors available for this platform");
                 return;
             }
 
-            eprintln!(
-                "collecting: {}",
-                collectors
+            info!(
+                collectors = %collectors
                     .iter()
                     .map(|c| c.name())
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(","),
+                "collecting"
             );
 
             let mut buf = String::with_capacity(8192);
@@ -331,7 +352,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
                                 buf = ret_b;
                             }
                             Err(e) => {
-                                eprintln!("collector tick failed, reinitializing: {e}");
+                                warn!("collector tick failed, reinitializing: {e}");
                                 collectors = metrics::init_collectors(&system_config);
                                 buf = String::with_capacity(8192);
                             }
@@ -349,7 +370,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
         let use_journal = match cfg.log_source {
             LogSource::Journald => {
                 if !logs::journal::is_available() {
-                    eprintln!("ERROR: log_source = \"journald\" but journalctl is not available");
+                    error!("log_source = \"journald\" but journalctl is not available");
                     process::exit(1);
                 }
                 true
@@ -362,7 +383,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
             let s = sink.clone();
             let cancel = shutdown_tx.subscribe();
             Some(tokio::spawn(async move {
-                eprintln!("log source: journald");
+                info!("log source: journald");
                 logs::tail_journal(s, cancel).await;
             }))
         } else if !cfg.logs.is_empty() {
@@ -371,7 +392,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
             let cancel = shutdown_tx.subscribe();
             let parse_syslog = cfg.parse_syslog;
             Some(tokio::spawn(async move {
-                eprintln!("log source: files {paths:?}");
+                info!(?paths, "log source: files");
                 logs::tail_files(&paths, s, cancel, parse_syslog).await;
             }))
         } else {
@@ -391,7 +412,7 @@ async fn run(config_path: &PathBuf) -> RunResult {
         let _ = h.await;
     }
     if let Err(e) = sink.close().await {
-        eprintln!("error during shutdown: {e}");
+        error!("error during shutdown: {e}");
     }
 
     match signal {
@@ -410,11 +431,11 @@ async fn wait_for_signal() -> Signal {
     {
         use tokio::signal::unix::{SignalKind, signal};
         let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
-            eprintln!("failed to register SIGTERM handler");
+            error!("failed to register SIGTERM handler");
             process::exit(1);
         };
         let Ok(mut sighup) = signal(SignalKind::hangup()) else {
-            eprintln!("failed to register SIGHUP handler");
+            error!("failed to register SIGHUP handler");
             process::exit(1);
         };
         let ctrl_c = tokio::signal::ctrl_c();

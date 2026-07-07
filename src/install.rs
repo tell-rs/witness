@@ -96,6 +96,15 @@ pub fn run(args: InstallArgs) {
 }
 
 fn execute(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // The install flow is systemd + useradd — Linux only.
+    if !cfg!(target_os = "linux") {
+        return Err(
+            "witness install requires Linux with systemd. On other platforms, \
+             run `witness setup` to write a config and start the binary directly."
+                .into(),
+        );
+    }
+
     // Must be root for user creation and systemd
     #[cfg(unix)]
     if unsafe { libc::geteuid() } != 0 {

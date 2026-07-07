@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::sink::{DryRun, Sink};
+use crate::sink::{Capture, DryRun, Recorded, Sink};
 use tell::{LogLevel, Temporality};
 
 fn dry_sink() -> Sink {
@@ -221,4 +221,87 @@ fn discard_counter_dyn_with_temporality() {
         &[("interface", "lo")],
         Temporality::Cumulative,
     );
+}
+
+// --- Capture sink ---
+
+#[test]
+fn test_capture_records_metric_with_merged_tags() {
+    let cap = Capture::new();
+    let mut tags = HashMap::new();
+    tags.insert("env".to_string(), "prod".to_string());
+    let sink = Sink::capture(cap.clone(), tags);
+
+    sink.gauge("test.metric", 42.0, &[("core", "0")]);
+
+    let events = cap.events();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        Recorded::Metric {
+            kind,
+            name,
+            value,
+            labels,
+        } => {
+            assert_eq!(*kind, "gauge");
+            assert_eq!(*name, "test.metric");
+            assert_eq!(*value, 42.0);
+            assert!(labels.contains(&("env".to_string(), "prod".to_string())));
+            assert!(labels.contains(&("core".to_string(), "0".to_string())));
+        }
+        other => panic!("expected metric, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_capture_metric_values_by_name() {
+    let cap = Capture::new();
+    let sink = Sink::capture(cap.clone(), HashMap::new());
+
+    sink.counter("net.bytes", 100.0, &[]);
+    sink.counter("net.bytes", 250.0, &[]);
+    sink.gauge("cpu.idle", 90.0, &[]);
+
+    assert_eq!(cap.metric_values("net.bytes"), vec![100.0, 250.0]);
+    assert_eq!(cap.metric_values("cpu.idle"), vec![90.0]);
+    assert!(cap.metric_values("missing").is_empty());
+}
+
+#[test]
+fn test_capture_records_log_service() {
+    let cap = Capture::new();
+    let sink = Sink::capture(cap.clone(), HashMap::new());
+
+    assert!(sink.try_log_with_service(
+        tell::LogLevel::Info,
+        "hello",
+        None,
+        Some("sshd"),
+        None::<()>,
+    ));
+
+    assert_eq!(
+        cap.events(),
+        vec![Recorded::Log {
+            message: "hello".to_string(),
+            service: Some("sshd".to_string()),
+        }]
+    );
+}
+
+// --- Tag interning ---
+
+#[test]
+fn test_leak_tags_interned_across_reloads() {
+    let mut tags = HashMap::new();
+    tags.insert("intern_test_key".to_string(), "intern_test_val".to_string());
+
+    let a = Sink::dry_run(DryRun::new(), tags.clone());
+    let b = Sink::dry_run(DryRun::new(), tags);
+
+    // Same distinct strings → same leaked pointers, no growth per reload.
+    let (ka, va) = a.tags_for_test()[0];
+    let (kb, vb) = b.tags_for_test()[0];
+    assert!(std::ptr::eq(ka, kb));
+    assert!(std::ptr::eq(va, vb));
 }

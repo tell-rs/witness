@@ -31,7 +31,6 @@
 - Backpressure — stops reading when the send channel is full without advancing offsets; the filesystem acts as overflow buffer.
 - Partial line buffering — holds bytes until a newline is seen, never emits truncated lines mid-write.
 - Platform-aware defaults — Linux: syslog, auth, kern, nginx, apache, postgres, mysql, mongodb, redis, haproxy, traefik, elasticsearch, rabbitmq. macOS: system.log.
-- Idle eviction — files with no new data for 1 hour automatically removed from tracking.
 
 ## Transport
 

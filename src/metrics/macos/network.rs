@@ -13,7 +13,12 @@ use crate::metrics::Collector;
 use crate::sink::Sink;
 
 pub struct NetworkCollector {
+    /// Last raw readings (u32 domain — see [`delta32`]).
     prev: HashMap<String, NetStats>,
+    /// Wrap-corrected cumulative totals since the collector first saw the
+    /// interface, used for checkpoint emission. The raw `if_data` counters
+    /// are u32 and wrap every 4 GiB, so they can't be used directly.
+    totals: HashMap<String, NetStats>,
     filter: DeviceFilter,
 }
 
@@ -33,8 +38,20 @@ impl NetworkCollector {
     pub fn new(filter: DeviceFilter) -> Self {
         Self {
             prev: HashMap::new(),
+            totals: HashMap::new(),
             filter,
         }
+    }
+}
+
+/// Delta between two readings of a u32 kernel counter (stored widened to
+/// u64). `if_data` counters wrap at 4 GiB; as long as less than one full
+/// wrap happens between ticks, the true delta is recoverable.
+pub(crate) fn delta32(cur: u64, prev: u64) -> u64 {
+    if cur >= prev {
+        cur - prev
+    } else {
+        cur + (1u64 << 32) - prev
     }
 }
 
@@ -55,56 +72,43 @@ impl Collector for NetworkCollector {
 
             if let Some(prev) = self.prev.get_mut(iface.as_str()) {
                 let labels: &[(&'static str, &str)] = &[("interface", iface)];
-                let d = |c: u64, p: u64| c.saturating_sub(p) as f64;
-                sink.counter_dyn(
-                    "system.net.bytes_recv",
-                    d(current.rx_bytes, prev.rx_bytes),
-                    labels,
-                );
-                sink.counter_dyn(
-                    "system.net.bytes_sent",
-                    d(current.tx_bytes, prev.tx_bytes),
-                    labels,
-                );
-                sink.counter_dyn(
-                    "system.net.packets_recv",
-                    d(current.rx_packets, prev.rx_packets),
-                    labels,
-                );
-                sink.counter_dyn(
-                    "system.net.packets_sent",
-                    d(current.tx_packets, prev.tx_packets),
-                    labels,
-                );
-                sink.counter_dyn(
-                    "system.net.errors_recv",
-                    d(current.rx_errors, prev.rx_errors),
-                    labels,
-                );
-                sink.counter_dyn(
-                    "system.net.errors_sent",
-                    d(current.tx_errors, prev.tx_errors),
-                    labels,
-                );
-                sink.counter_dyn(
-                    "system.net.drops_recv",
-                    d(current.rx_drops, prev.rx_drops),
-                    labels,
-                );
-                sink.counter_dyn(
-                    "system.net.drops_sent",
-                    d(current.tx_drops, prev.tx_drops),
-                    labels,
-                );
+                let delta = NetStats {
+                    rx_bytes: delta32(current.rx_bytes, prev.rx_bytes),
+                    rx_packets: delta32(current.rx_packets, prev.rx_packets),
+                    rx_errors: delta32(current.rx_errors, prev.rx_errors),
+                    rx_drops: delta32(current.rx_drops, prev.rx_drops),
+                    tx_bytes: delta32(current.tx_bytes, prev.tx_bytes),
+                    tx_packets: delta32(current.tx_packets, prev.tx_packets),
+                    tx_errors: delta32(current.tx_errors, prev.tx_errors),
+                    tx_drops: delta32(current.tx_drops, prev.tx_drops),
+                };
+                sink.counter_dyn("system.net.bytes_recv", delta.rx_bytes as f64, labels);
+                sink.counter_dyn("system.net.bytes_sent", delta.tx_bytes as f64, labels);
+                sink.counter_dyn("system.net.packets_recv", delta.rx_packets as f64, labels);
+                sink.counter_dyn("system.net.packets_sent", delta.tx_packets as f64, labels);
+                sink.counter_dyn("system.net.errors_recv", delta.rx_errors as f64, labels);
+                sink.counter_dyn("system.net.errors_sent", delta.tx_errors as f64, labels);
+                sink.counter_dyn("system.net.drops_recv", delta.rx_drops as f64, labels);
+                sink.counter_dyn("system.net.drops_sent", delta.tx_drops as f64, labels);
+
+                let totals = self.totals.entry(iface.clone()).or_default();
+                totals.rx_bytes += delta.rx_bytes;
+                totals.rx_packets += delta.rx_packets;
+                totals.tx_bytes += delta.tx_bytes;
+                totals.tx_packets += delta.tx_packets;
+
                 *prev = current.clone();
             } else {
                 self.prev.insert(iface.clone(), current.clone());
+                // Seed cumulative totals from the first raw reading — the
+                // closest available approximation of "since boot".
+                self.totals.insert(iface.clone(), current.clone());
             }
         }
     }
 
     fn checkpoint(&mut self, sink: &Sink, _hostname: &str) {
-        for (iface, stats) in &self.prev {
+        for (iface, stats) in &self.totals {
             let labels: &[(&'static str, &str)] = &[("interface", iface)];
             sink.counter_dyn_with_temporality(
                 "system.net.bytes_recv",

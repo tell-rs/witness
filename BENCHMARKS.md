@@ -2,11 +2,25 @@
 
 Identical methodology. Same null TCP receiver (Rust), same data, same timing. Apple M4 Pro.
 
-## How to reproduce
+## Micro-benchmarks (criterion)
+
+`benchmark/app_fields_payload.rs` is a criterion bench covering the journald
+structured-field extraction hot path (empty/typical/heavy payload shapes):
+
+```bash
+cargo bench
+```
+
+Numbers are not tracked in CI — treat published figures as
+point-in-time measurements from the machine noted above.
+
+## Throughput comparison — how to reproduce
 
 ```bash
 ./benchmark/run.sh
 ```
+
+Manual and non-reproducible in CI: it clones and builds Vector locally.
 
 Clones Vector into `../vector` if not present, builds both with release optimizations, and runs the benchmark. If Vector is already built, it reuses it.
 

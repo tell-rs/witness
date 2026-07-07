@@ -90,23 +90,30 @@ impl Collector for NetworkCollector {
                 continue;
             }
 
-            let parts: Vec<u64> = stats
+            // First 12 numeric fields, parsed off the iterator — no per-line Vec.
+            let mut vals = [0u64; 12];
+            let mut n = 0;
+            for v in stats
                 .split_whitespace()
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            if parts.len() < 12 {
+                .filter_map(|s| s.parse::<u64>().ok())
+                .take(12)
+            {
+                vals[n] = v;
+                n += 1;
+            }
+            if n < 12 {
                 continue;
             }
 
             let current = NetStats {
-                rx_bytes: parts[0],
-                rx_packets: parts[1],
-                rx_errors: parts[2],
-                rx_drops: parts[3],
-                tx_bytes: parts[8],
-                tx_packets: parts[9],
-                tx_errors: parts[10],
-                tx_drops: parts[11],
+                rx_bytes: vals[0],
+                rx_packets: vals[1],
+                rx_errors: vals[2],
+                rx_drops: vals[3],
+                tx_bytes: vals[8],
+                tx_packets: vals[9],
+                tx_errors: vals[10],
+                tx_drops: vals[11],
             };
 
             if let Some(prev) = self.prev.get_mut(iface) {

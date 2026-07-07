@@ -15,19 +15,19 @@ pub struct CpuCollector {
 }
 
 #[derive(Clone, Default)]
-struct CpuTimes {
-    user: u64,
-    nice: u64,
-    system: u64,
-    idle: u64,
-    iowait: u64,
-    irq: u64,
-    softirq: u64,
-    steal: u64,
+pub(crate) struct CpuTimes {
+    pub(crate) user: u64,
+    pub(crate) nice: u64,
+    pub(crate) system: u64,
+    pub(crate) idle: u64,
+    pub(crate) iowait: u64,
+    pub(crate) irq: u64,
+    pub(crate) softirq: u64,
+    pub(crate) steal: u64,
 }
 
 impl CpuTimes {
-    fn total(&self) -> u64 {
+    pub(crate) fn total(&self) -> u64 {
         self.user
             + self.nice
             + self.system
@@ -117,7 +117,7 @@ impl Collector for CpuCollector {
     }
 }
 
-fn parse_cpu_line(parts: &mut std::str::SplitWhitespace<'_>) -> CpuTimes {
+pub(crate) fn parse_cpu_line(parts: &mut std::str::SplitWhitespace<'_>) -> CpuTimes {
     let p = |parts: &mut std::str::SplitWhitespace<'_>| -> u64 {
         parts.next().and_then(|s| s.parse().ok()).unwrap_or(0)
     };

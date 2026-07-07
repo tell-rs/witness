@@ -11,7 +11,7 @@ use serde::Deserialize;
 /// ```toml
 /// api_key = "feed1e11feed1e11feed1e11feed1e11"
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub struct AgentConfig {
     /// API key for authentication (32 hex chars, required).
@@ -80,7 +80,7 @@ pub struct AgentConfig {
 ///
 /// All collectors are enabled by default. Set to `false` to disable.
 /// Sub-tables (`[system.network]`, `[system.disk]`) configure filtering.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub struct SystemConfig {
     /// Enable/disable CPU collector.
@@ -138,7 +138,7 @@ pub struct SystemConfig {
 }
 
 /// Include/exclude glob filter.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct FilterConfig {
     #[serde(default)]
     pub include: Vec<String>,
@@ -322,12 +322,19 @@ impl DeviceFilter {
 
 pub fn load_config(path: &PathBuf) -> Result<AgentConfig, Box<dyn std::error::Error>> {
     let contents = std::fs::read_to_string(path)?;
-    let config: AgentConfig = toml::from_str(&contents)?;
+    parse_config(&contents)
+}
+
+/// Parse and validate config TOML. Used by `load_config` and by `witness
+/// setup` to reject a broken server-provided config before writing it.
+pub fn parse_config(contents: &str) -> Result<AgentConfig, Box<dyn std::error::Error>> {
+    let config: AgentConfig = toml::from_str(contents)?;
     validate_api_key(&config.api_key)?;
     Ok(config)
 }
 
-fn validate_api_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Validate an API key/token: exactly 32 hex characters.
+pub fn validate_api_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
     if key.is_empty() {
         return Err("api_key is required".into());
     }

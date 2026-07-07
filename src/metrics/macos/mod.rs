@@ -22,6 +22,16 @@ mod network_test;
 use crate::config::{DeviceFilter, SystemConfig};
 use crate::metrics::Collector;
 
+/// The mach host port, fetched once per process.
+///
+/// `mach_host_self()` allocates a new send-right reference on every call and
+/// we never release them — calling it per tick leaks a reference each time.
+pub(crate) fn host_port() -> u32 {
+    use std::sync::OnceLock;
+    static HOST: OnceLock<u32> = OnceLock::new();
+    *HOST.get_or_init(|| unsafe { mach2::mach_init::mach_host_self() })
+}
+
 pub fn init_collectors(config: &SystemConfig) -> Vec<Box<dyn Collector>> {
     let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
 

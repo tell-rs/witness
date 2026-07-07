@@ -22,7 +22,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml pins the actual toolchain (rustup honors it);
+      # the action just ensures rustup is primed.
+      - uses: dtolnay/rust-toolchain@1.93.0
       - run: cargo fmt --check
 
   clippy:
@@ -31,7 +33,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.93.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -41,13 +43,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings -A clippy::collapsible_if
 
+  deny:
+    name: Licenses & advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   test:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.93.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
@@ -55,6 +67,6 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Build
-        run: cargo build --all
+        run: cargo build --all --profile ci-test
       - name: Test
-        run: cargo nextest run --all --no-fail-fast
+        run: cargo nextest run --all --no-fail-fast --cargo-profile ci-test

@@ -31,15 +31,25 @@ pub(crate) struct CpuPrev {
     pub(crate) system_usec: u64,
 }
 
+/// Re-run container discovery every N ticks (60s at the default 15s
+/// interval). Discovery walks several cgroup directory trees; metric reads
+/// from already-known containers happen every tick.
+const DISCOVERY_INTERVAL_TICKS: u32 = 4;
+
 pub struct ContainerCollector {
-    /// Keyed by full container ID (64 hex chars).
+    /// Keyed by 12-char short container ID (also used as the metric label).
     prev_cpu: HashMap<String, CpuPrev>,
+    /// Cached discovery results, refreshed every [`DISCOVERY_INTERVAL_TICKS`].
+    containers: Vec<ContainerInfo>,
+    tick_count: u32,
 }
 
 impl ContainerCollector {
     pub fn new() -> Self {
         Self {
             prev_cpu: HashMap::new(),
+            containers: Vec::new(),
+            tick_count: 0,
         }
     }
 }
@@ -50,11 +60,15 @@ impl Collector for ContainerCollector {
     }
 
     fn collect(&mut self, sink: &Sink, _hostname: &str, buf: &mut String) {
-        let containers = discover_containers();
+        if self.tick_count.is_multiple_of(DISCOVERY_INTERVAL_TICKS) {
+            self.containers = discover_containers();
+        }
+        self.tick_count = self.tick_count.wrapping_add(1);
 
+        let containers = &self.containers;
         let mut seen_ids: Vec<&str> = Vec::with_capacity(containers.len());
 
-        for c in &containers {
+        for c in containers {
             seen_ids.push(&c.short_id);
             let labels: &[(&'static str, &str)] =
                 &[("container_id", &c.short_id), ("runtime", c.runtime)];

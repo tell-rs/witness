@@ -56,7 +56,7 @@ impl Collector for MemoryCollector {
     }
 }
 
-fn parse_kb(s: &str) -> Option<f64> {
+pub(crate) fn parse_kb(s: &str) -> Option<f64> {
     let num: f64 = s.split_whitespace().next()?.parse().ok()?;
     Some(num * 1024.0)
 }

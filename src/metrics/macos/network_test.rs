@@ -54,3 +54,19 @@ fn network_checkpoint_after_multiple_collects() {
     // Checkpoint after multiple deltas should work
     collector.checkpoint(&sink, "test");
 }
+
+#[test]
+fn network_delta32_normal() {
+    use super::network::delta32;
+    assert_eq!(delta32(1000, 400), 600);
+    assert_eq!(delta32(5, 5), 0);
+}
+
+#[test]
+fn network_delta32_u32_wrap() {
+    use super::network::delta32;
+    // Counter wrapped: prev near u32::MAX, current small again.
+    let prev = u64::from(u32::MAX) - 100;
+    let cur = 400u64;
+    assert_eq!(delta32(cur, prev), 501);
+}

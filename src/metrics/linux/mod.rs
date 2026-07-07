@@ -11,11 +11,23 @@ pub mod process;
 pub mod tcp;
 
 #[cfg(test)]
+mod cgroups_test;
+#[cfg(test)]
 mod container_test;
+#[cfg(test)]
+mod cpu_test;
 #[cfg(test)]
 mod disk_test;
 #[cfg(test)]
+mod load_test;
+#[cfg(test)]
+mod memory_test;
+#[cfg(test)]
 mod network_test;
+#[cfg(test)]
+mod process_test;
+#[cfg(test)]
+mod tcp_test;
 
 use crate::config::{DeviceFilter, SystemConfig};
 use crate::metrics::Collector;

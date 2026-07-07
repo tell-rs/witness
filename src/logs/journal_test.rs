@@ -1,4 +1,5 @@
 use super::journal;
+use super::journal::ProcessResult;
 use crate::sink::{DryRun, Sink};
 
 // --- process_entry ---
@@ -9,7 +10,7 @@ fn test_process_entry_valid() {
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = r#"{"MESSAGE":"Connection accepted","SYSLOG_IDENTIFIER":"sshd","PRIORITY":"6","__CURSOR":"s=abc"}"#;
     let result = journal::process_entry(json, &sink);
-    assert_eq!(result, Some(Some("s=abc".to_string())));
+    assert_eq!(result, ProcessResult::Handled(Some("s=abc".to_string())));
     assert_eq!(dr.count(), 1);
 }
 
@@ -19,7 +20,7 @@ fn test_process_entry_missing_message() {
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = r#"{"SYSLOG_IDENTIFIER":"sshd","PRIORITY":"6","__CURSOR":"s=abc"}"#;
     let result = journal::process_entry(json, &sink);
-    assert_eq!(result, Some(Some("s=abc".to_string())));
+    assert_eq!(result, ProcessResult::Handled(Some("s=abc".to_string())));
     assert_eq!(dr.count(), 0); // Not shipped — no message
 }
 
@@ -29,7 +30,7 @@ fn test_process_entry_empty_message() {
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = r#"{"MESSAGE":"","SYSLOG_IDENTIFIER":"sshd","__CURSOR":"s=abc"}"#;
     let result = journal::process_entry(json, &sink);
-    assert_eq!(result, Some(Some("s=abc".to_string())));
+    assert_eq!(result, ProcessResult::Handled(Some("s=abc".to_string())));
     assert_eq!(dr.count(), 0);
 }
 
@@ -39,14 +40,17 @@ fn test_process_entry_filters_witness() {
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = r#"{"MESSAGE":"journal watcher starting","SYSLOG_IDENTIFIER":"witness","PRIORITY":"6","__CURSOR":"s=abc"}"#;
     let result = journal::process_entry(json, &sink);
-    assert_eq!(result, Some(Some("s=abc".to_string())));
+    assert_eq!(result, ProcessResult::Handled(Some("s=abc".to_string())));
     assert_eq!(dr.count(), 0); // Filtered — not shipped
 }
 
 #[test]
 fn test_process_entry_malformed_json() {
     let sink = Sink::discard();
-    assert_eq!(journal::process_entry("not json at all", &sink), None);
+    assert_eq!(
+        journal::process_entry("not json at all", &sink),
+        ProcessResult::ParseFailed
+    );
 }
 
 #[test]
@@ -54,7 +58,10 @@ fn test_process_entry_empty_json() {
     let dr = DryRun::new();
     let sink = Sink::dry_run(dr.clone(), Default::default());
     // Empty object — no MESSAGE, no cursor
-    assert_eq!(journal::process_entry("{}", &sink), Some(None));
+    assert_eq!(
+        journal::process_entry("{}", &sink),
+        ProcessResult::Handled(None)
+    );
     assert_eq!(dr.count(), 0);
 }
 
@@ -64,7 +71,7 @@ fn test_process_entry_no_cursor() {
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = r#"{"MESSAGE":"hello","SYSLOG_IDENTIFIER":"sshd","PRIORITY":"6"}"#;
     let result = journal::process_entry(json, &sink);
-    assert_eq!(result, Some(None)); // Parsed but no cursor
+    assert_eq!(result, ProcessResult::Handled(None)); // Parsed but no cursor
     assert_eq!(dr.count(), 1); // Still shipped
 }
 
@@ -75,7 +82,7 @@ fn test_process_entry_comm_fallback() {
     // No SYSLOG_IDENTIFIER — falls back to _COMM
     let json = r#"{"MESSAGE":"hello","_COMM":"myapp","PRIORITY":"3","__CURSOR":"s=x"}"#;
     let result = journal::process_entry(json, &sink);
-    assert_eq!(result, Some(Some("s=x".to_string())));
+    assert_eq!(result, ProcessResult::Handled(Some("s=x".to_string())));
     assert_eq!(dr.count(), 1);
 }
 
@@ -86,7 +93,7 @@ fn test_process_entry_default_priority() {
     // No PRIORITY — defaults to Info
     let json = r#"{"MESSAGE":"hello","SYSLOG_IDENTIFIER":"sshd","__CURSOR":"s=y"}"#;
     let result = journal::process_entry(json, &sink);
-    assert_eq!(result, Some(Some("s=y".to_string())));
+    assert_eq!(result, ProcessResult::Handled(Some("s=y".to_string())));
     assert_eq!(dr.count(), 1);
 }
 
@@ -98,7 +105,7 @@ fn test_process_entry_ignores_unknown_fields() {
     // out of the outgoing payload by app_fields_payload.
     let json = r#"{"MESSAGE":"started","SYSLOG_IDENTIFIER":"nginx","_SYSTEMD_UNIT":"nginx.service","_PID":"123","__CURSOR":"s=z"}"#;
     let result = journal::process_entry(json, &sink);
-    assert_eq!(result, Some(Some("s=z".to_string())));
+    assert_eq!(result, ProcessResult::Handled(Some("s=z".to_string())));
     assert_eq!(dr.count(), 1);
 }
 
@@ -269,7 +276,7 @@ fn test_process_entry_whitespace_trimmed() {
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = "  {\"MESSAGE\":\"hello\",\"SYSLOG_IDENTIFIER\":\"sshd\",\"__CURSOR\":\"s=t\"}  \n";
     let result = journal::process_entry(json, &sink);
-    assert_eq!(result, Some(Some("s=t".to_string())));
+    assert_eq!(result, ProcessResult::Handled(Some("s=t".to_string())));
     assert_eq!(dr.count(), 1);
 }
 
@@ -317,4 +324,51 @@ fn test_priority_to_level_invalid() {
     assert!(journal::priority_to_level("").is_none());
     assert!(journal::priority_to_level("info").is_none());
     assert!(journal::priority_to_level("-1").is_none());
+}
+
+// --- backpressure ---
+
+#[test]
+fn test_process_entry_channel_full() {
+    let sink = Sink::full();
+    let json = r#"{"MESSAGE":"hello","SYSLOG_IDENTIFIER":"sshd","__CURSOR":"s=abc"}"#;
+    assert_eq!(
+        journal::process_entry(json, &sink),
+        ProcessResult::ChannelFull
+    );
+}
+
+#[test]
+fn test_process_entry_channel_full_filtered_still_handled() {
+    // Filtered entries never touch the channel — handled even when full,
+    // so the cursor can advance past them.
+    let sink = Sink::full();
+    let json = r#"{"MESSAGE":"x","SYSLOG_IDENTIFIER":"witness","__CURSOR":"s=abc"}"#;
+    assert_eq!(
+        journal::process_entry(json, &sink),
+        ProcessResult::Handled(Some("s=abc".to_string()))
+    );
+}
+
+// --- logfmt UTF-8 ---
+
+#[test]
+fn test_split_message_logfmt_quoted_multibyte_value() {
+    let (body, fields) = journal::split_message(r#"login failed user="Jürgen Müller" ip=10.0.0.1"#);
+    assert_eq!(body, "login failed");
+    let f = fields.unwrap();
+    assert_eq!(f["user"], "Jürgen Müller");
+    assert_eq!(f["ip"], "10.0.0.1");
+}
+
+#[test]
+fn test_split_message_logfmt_bare_multibyte_value() {
+    let (_, fields) = journal::split_message("evt city=Zürich");
+    assert_eq!(fields.unwrap()["city"], "Zürich");
+}
+
+#[test]
+fn test_split_message_logfmt_escape_adjacent_to_multibyte() {
+    let (_, fields) = journal::split_message(r#"evt msg="a\"é\"b""#);
+    assert_eq!(fields.unwrap()["msg"], "a\"é\"b");
 }

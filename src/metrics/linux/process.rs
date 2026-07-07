@@ -5,6 +5,7 @@
 //! - system.process.memory_rss   label {pid, name}
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::metrics::{Collector, read_procfs};
 use crate::sink::Sink;
@@ -13,6 +14,10 @@ pub struct ProcessCollector {
     top_n: usize,
     prev: HashMap<u32, ProcTimes>,
     page_size: u64,
+    /// Jiffies per second (`_SC_CLK_TCK`), for jiffie → percent conversion.
+    clk_tck: f64,
+    /// When the previous collection ran, for delta normalization.
+    last_collect: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -31,10 +36,13 @@ struct ProcSnapshot {
 impl ProcessCollector {
     pub fn new(top_n: usize) -> Self {
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         Self {
             top_n: top_n.max(1),
             prev: HashMap::new(),
             page_size,
+            clk_tck: if clk_tck > 0 { clk_tck as f64 } else { 100.0 },
+            last_collect: None,
         }
     }
 }
@@ -48,6 +56,14 @@ impl Collector for ProcessCollector {
         let Ok(entries) = std::fs::read_dir("/proc") else {
             return;
         };
+
+        // Jiffie deltas are normalized by the actual elapsed time so the
+        // emitted value is a true percentage, independent of tick interval.
+        let elapsed = self
+            .last_collect
+            .replace(Instant::now())
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
 
         let mut snapshots: Vec<ProcSnapshot> = Vec::new();
         let mut seen_pids = std::collections::HashSet::<u32>::new();
@@ -99,13 +115,16 @@ impl Collector for ProcessCollector {
 
         // Top N by CPU
         snapshots.sort_unstable_by(|a, b| b.cpu_delta.cmp(&a.cpu_delta));
-        for proc in snapshots.iter().take(self.top_n) {
-            if proc.cpu_delta == 0 {
-                break;
+        if elapsed > 0.0 {
+            for proc in snapshots.iter().take(self.top_n) {
+                if proc.cpu_delta == 0 {
+                    break;
+                }
+                let percent = proc.cpu_delta as f64 / self.clk_tck / elapsed * 100.0;
+                let pid_str = proc.pid.to_string();
+                let labels: &[(&'static str, &str)] = &[("pid", &pid_str), ("name", &proc.name)];
+                sink.gauge_dyn("system.process.cpu_percent", percent, labels);
             }
-            let pid_str = proc.pid.to_string();
-            let labels: &[(&'static str, &str)] = &[("pid", &pid_str), ("name", &proc.name)];
-            sink.gauge_dyn("system.process.cpu_jiffies", proc.cpu_delta as f64, labels);
         }
 
         // Top N by RSS
@@ -121,17 +140,17 @@ impl Collector for ProcessCollector {
     }
 }
 
-struct ParsedProc {
-    pid: u32,
-    name: String,
-    utime: u64,
-    stime: u64,
-    rss_bytes: u64,
+pub(crate) struct ParsedProc {
+    pub(crate) pid: u32,
+    pub(crate) name: String,
+    pub(crate) utime: u64,
+    pub(crate) stime: u64,
+    pub(crate) rss_bytes: u64,
 }
 
 /// Parse /proc/{pid}/stat. The comm field is in parentheses and may contain
 /// spaces and ')'. Find the LAST ')' to correctly delimit it.
-fn parse_proc_stat(buf: &str, pid: u32, page_size: u64) -> Option<ParsedProc> {
+pub(crate) fn parse_proc_stat(buf: &str, pid: u32, page_size: u64) -> Option<ParsedProc> {
     // Format: "pid (comm) state ppid ..."
     let open = buf.find('(')?;
     let close = buf.rfind(')')?;

@@ -32,7 +32,7 @@ impl Collector for TcpCollector {
     }
 }
 
-fn count_states(buf: &str, counts: &mut [u32; 12]) {
+pub(crate) fn count_states(buf: &str, counts: &mut [u32; 12]) {
     for line in buf.lines().skip(1) {
         // Fields: sl local_address rem_address st ...
         let mut parts = line.split_whitespace();

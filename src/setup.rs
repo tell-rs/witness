@@ -66,12 +66,20 @@ fn execute(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         generate_default(&args.token, endpoint)
     } else {
         match fetch_config(&args.server, &args.token) {
-            Ok(toml) => {
-                eprintln!("fetched config from {}", args.server);
-                toml
-            }
-            Err(_) => {
-                eprintln!("using local defaults");
+            // Validate before writing — a bad server response must not
+            // brick the agent's config.
+            Ok(toml) => match crate::config::parse_config(&toml) {
+                Ok(_) => {
+                    eprintln!("fetched config from {}", args.server);
+                    toml
+                }
+                Err(e) => {
+                    eprintln!("server returned invalid config ({e}); using local defaults");
+                    generate_default(&args.token, endpoint)
+                }
+            },
+            Err(e) => {
+                eprintln!("config fetch failed ({e}); using local defaults");
                 generate_default(&args.token, endpoint)
             }
         }
@@ -93,7 +101,7 @@ fn execute(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         // Try to chown to root:witness (best-effort, may fail if user doesn't exist yet)
         let path = std::ffi::CString::new(args.config.to_string_lossy().as_bytes().to_vec())?;
-        let group = std::ffi::CString::new("witness").unwrap();
+        let group = std::ffi::CString::new("witness").expect("static string has no NUL bytes");
         unsafe {
             let gr = libc::getgrnam(group.as_ptr());
             if !gr.is_null() {
@@ -114,32 +122,40 @@ fn validate_token(token: &str) -> Result<(), Box<dyn std::error::Error>> {
     if token.is_empty() {
         return Err("--token is required".into());
     }
-    if token.len() != 32 {
-        return Err(format!("token must be 32 hex characters, got {}", token.len()).into());
-    }
-    if !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("token must contain only hex characters (0-9, a-f)".into());
-    }
-    Ok(())
+    crate::config::validate_api_key(token).map_err(|e| format!("invalid --token: {e}").into())
 }
 
 /// Fetch agent config from the Tell server using curl.
+///
+/// The Authorization header goes to curl via `--config -` (stdin), not argv —
+/// argv is visible to every local user through `ps`.
 fn fetch_config(server: &str, token: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Write;
+
     let url = format!("{}/v1/agent/config", server.trim_end_matches('/'));
 
-    let output = Command::new("curl")
+    let mut child = Command::new("curl")
         .args([
             "-sSf",
             "--max-time",
             "10",
             "-H",
-            &format!("Authorization: Bearer {token}"),
-            "-H",
             &format!("User-Agent: witness/{}", env!("CARGO_PKG_VERSION")),
+            "--config",
+            "-",
             &url,
         ])
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("curl not found: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        writeln!(stdin, "header = \"Authorization: Bearer {token}\"")?;
+    }
+
+    let output = child.wait_with_output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

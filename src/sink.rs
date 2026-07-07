@@ -1,8 +1,8 @@
 //! Metric/log sink — wraps Tell for live mode, prints to stderr for dry-run.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use tell::{LogLevel, Tell, Temporality};
 
@@ -26,6 +26,92 @@ enum SinkInner {
     /// Simulates a full SDK channel. `try_log` always returns false.
     #[cfg(test)]
     Full,
+    /// Records every emission for value-level test assertions.
+    #[cfg(test)]
+    Capture(Capture),
+}
+
+/// Test sink that records `(kind, name, value, labels)` for every metric and
+/// the message/service for every log, so tests can assert real output instead
+/// of just "didn't panic".
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct Capture {
+    events: Arc<std::sync::Mutex<Vec<Recorded>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Recorded {
+    Metric {
+        kind: &'static str,
+        name: &'static str,
+        value: f64,
+        labels: Vec<(String, String)>,
+    },
+    Log {
+        message: String,
+        service: Option<String>,
+    },
+}
+
+#[cfg(test)]
+impl Capture {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn events(&self) -> Vec<Recorded> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Values of every metric emitted under `name`, in emission order.
+    pub fn metric_values(&self, name: &str) -> Vec<f64> {
+        self.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Recorded::Metric { name: n, value, .. } if n == name => Some(value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn record_metric(
+        &self,
+        kind: &'static str,
+        name: &'static str,
+        value: f64,
+        tags: &[(&'static str, &'static str)],
+        labels: &[(&'static str, &str)],
+    ) {
+        let labels = tags
+            .iter()
+            .map(|&(k, v)| (k.to_string(), v.to_string()))
+            .chain(labels.iter().map(|&(k, v)| (k.to_string(), v.to_string())))
+            .collect();
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Recorded::Metric {
+                kind,
+                name,
+                value,
+                labels,
+            });
+    }
+
+    fn record_log(&self, message: &str, service: Option<&str>) {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Recorded::Log {
+                message: message.to_string(),
+                service: service.map(str::to_string),
+            });
+    }
 }
 
 #[derive(Clone)]
@@ -82,6 +168,21 @@ impl Sink {
         }
     }
 
+    /// Sink that records every emission for value-level test assertions.
+    #[cfg(test)]
+    pub fn capture(cap: Capture, tags: HashMap<String, String>) -> Self {
+        Self {
+            inner: SinkInner::Capture(cap),
+            tags: leak_tags(tags),
+        }
+    }
+
+    /// The merged global tag slice (test-only, for interning assertions).
+    #[cfg(test)]
+    pub fn tags_for_test(&self) -> &[(&'static str, &'static str)] {
+        &self.tags
+    }
+
     // --- Gauges ---
 
     pub fn gauge(&self, name: &'static str, value: f64, labels: &[(&'static str, &'static str)]) {
@@ -90,8 +191,7 @@ impl Sink {
                 if self.tags.is_empty() {
                     tell.gauge(name, value, labels);
                 } else {
-                    let m = merge_static(&self.tags, labels);
-                    tell.gauge(name, value, &m);
+                    with_merged(&self.tags, labels, |m| tell.gauge(name, value, m));
                 }
             }
             SinkInner::DryRun(dr) => {
@@ -106,6 +206,8 @@ impl Sink {
             SinkInner::Discard => {}
             #[cfg(test)]
             SinkInner::Full => {}
+            #[cfg(test)]
+            SinkInner::Capture(c) => c.record_metric("gauge", name, value, &self.tags, labels),
         }
     }
 
@@ -115,8 +217,7 @@ impl Sink {
                 if self.tags.is_empty() {
                     tell.gauge_dyn(name, value, labels);
                 } else {
-                    let m = merge_dyn(&self.tags, labels);
-                    tell.gauge_dyn(name, value, &m);
+                    with_merged(&self.tags, labels, |m| tell.gauge_dyn(name, value, m));
                 }
             }
             SinkInner::DryRun(dr) => {
@@ -131,6 +232,8 @@ impl Sink {
             SinkInner::Discard => {}
             #[cfg(test)]
             SinkInner::Full => {}
+            #[cfg(test)]
+            SinkInner::Capture(c) => c.record_metric("gauge", name, value, &self.tags, labels),
         }
     }
 
@@ -143,8 +246,7 @@ impl Sink {
                 if self.tags.is_empty() {
                     tell.counter(name, value, labels);
                 } else {
-                    let m = merge_static(&self.tags, labels);
-                    tell.counter(name, value, &m);
+                    with_merged(&self.tags, labels, |m| tell.counter(name, value, m));
                 }
             }
             SinkInner::DryRun(dr) => {
@@ -159,6 +261,8 @@ impl Sink {
             SinkInner::Discard => {}
             #[cfg(test)]
             SinkInner::Full => {}
+            #[cfg(test)]
+            SinkInner::Capture(c) => c.record_metric("counter", name, value, &self.tags, labels),
         }
     }
 
@@ -168,8 +272,7 @@ impl Sink {
                 if self.tags.is_empty() {
                     tell.counter_dyn(name, value, labels);
                 } else {
-                    let m = merge_dyn(&self.tags, labels);
-                    tell.counter_dyn(name, value, &m);
+                    with_merged(&self.tags, labels, |m| tell.counter_dyn(name, value, m));
                 }
             }
             SinkInner::DryRun(dr) => {
@@ -184,6 +287,8 @@ impl Sink {
             SinkInner::Discard => {}
             #[cfg(test)]
             SinkInner::Full => {}
+            #[cfg(test)]
+            SinkInner::Capture(c) => c.record_metric("counter", name, value, &self.tags, labels),
         }
     }
 
@@ -199,8 +304,9 @@ impl Sink {
                 if self.tags.is_empty() {
                     tell.counter_dyn_with_temporality(name, value, labels, temporality);
                 } else {
-                    let m = merge_dyn(&self.tags, labels);
-                    tell.counter_dyn_with_temporality(name, value, &m, temporality);
+                    with_merged(&self.tags, labels, |m| {
+                        tell.counter_dyn_with_temporality(name, value, m, temporality)
+                    });
                 }
             }
             SinkInner::DryRun(dr) => {
@@ -215,6 +321,8 @@ impl Sink {
             SinkInner::Discard => {}
             #[cfg(test)]
             SinkInner::Full => {}
+            #[cfg(test)]
+            SinkInner::Capture(c) => c.record_metric("checkpoint", name, value, &self.tags, labels),
         }
     }
 
@@ -238,6 +346,8 @@ impl Sink {
             SinkInner::Discard => {}
             #[cfg(test)]
             SinkInner::Full => {}
+            #[cfg(test)]
+            SinkInner::Capture(c) => c.record_log(message, None),
         }
     }
 
@@ -261,6 +371,11 @@ impl Sink {
             SinkInner::Discard => true,
             #[cfg(test)]
             SinkInner::Full => false,
+            #[cfg(test)]
+            SinkInner::Capture(c) => {
+                c.record_log(message, None);
+                true
+            }
         }
     }
 
@@ -287,6 +402,11 @@ impl Sink {
             SinkInner::Discard => true,
             #[cfg(test)]
             SinkInner::Full => false,
+            #[cfg(test)]
+            SinkInner::Capture(c) => {
+                c.record_log(message, service);
+                true
+            }
         }
     }
 
@@ -310,7 +430,7 @@ impl Sink {
             SinkInner::Live(tell) => tell.flush().await,
             SinkInner::DryRun(_) | SinkInner::Discard => Ok(()),
             #[cfg(test)]
-            SinkInner::Full => Ok(()),
+            SinkInner::Full | SinkInner::Capture(_) => Ok(()),
         }
     }
 
@@ -319,49 +439,67 @@ impl Sink {
             SinkInner::Live(tell) => tell.close().await,
             SinkInner::DryRun(_) | SinkInner::Discard => Ok(()),
             #[cfg(test)]
-            SinkInner::Full => Ok(()),
+            SinkInner::Full | SinkInner::Capture(_) => Ok(()),
         }
     }
 }
 
 // --- Tag helpers ---
 
-/// Leak tag key/value strings to `'static` lifetime. The individual strings
-/// are leaked via `Box::leak` (bounded by config size, a few hundred bytes).
-/// The returned `Arc` is freed when all `Sink` clones are dropped, so SIGHUP
-/// reload reclaims the slice memory.
-fn leak_tags(tags: HashMap<String, String>) -> Arc<[(&'static str, &'static str)]> {
-    let mut pairs: Vec<(&'static str, &'static str)> = Vec::with_capacity(tags.len());
-    for (k, v) in tags {
-        let k: &'static str = Box::leak(k.into_boxed_str());
-        let v: &'static str = Box::leak(v.into_boxed_str());
-        pairs.push((k, v));
+/// Intern table for tag strings. The SDK label type requires `&'static str`,
+/// so tag strings must be leaked — interning bounds total leakage to the set
+/// of distinct strings ever seen, making repeated SIGHUP reloads free.
+/// Cold path only: touched at Sink construction, never per metric.
+static TAG_INTERN: LazyLock<Mutex<HashSet<&'static str>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn intern(s: String) -> &'static str {
+    let mut set = TAG_INTERN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match set.get(s.as_str()) {
+        Some(&existing) => existing,
+        None => {
+            let leaked: &'static str = Box::leak(s.into_boxed_str());
+            set.insert(leaked);
+            leaked
+        }
     }
+}
+
+/// Convert config tags to `'static` label pairs via the intern table.
+fn leak_tags(tags: HashMap<String, String>) -> Arc<[(&'static str, &'static str)]> {
+    let mut pairs: Vec<(&'static str, &'static str)> = tags
+        .into_iter()
+        .map(|(k, v)| (intern(k), intern(v)))
+        .collect();
     // Sort for deterministic label order
     pairs.sort_by_key(|&(k, _)| k);
     Arc::from(pairs)
 }
 
-fn merge_static(
-    tags: &[(&'static str, &'static str)],
-    labels: &[(&'static str, &'static str)],
-) -> Vec<(&'static str, &'static str)> {
-    let mut m = Vec::with_capacity(tags.len() + labels.len());
-    m.extend_from_slice(tags);
-    m.extend_from_slice(labels);
-    m
-}
-
-fn merge_dyn<'a>(
+/// Call `f` with global tags prepended to `labels`.
+///
+/// Hot path: uses a fixed stack buffer for typical label counts and only
+/// falls back to a heap `Vec` beyond 16 total pairs.
+fn with_merged<'a, R>(
     tags: &[(&'static str, &'static str)],
     labels: &[(&'static str, &'a str)],
-) -> Vec<(&'static str, &'a str)> {
-    let mut m = Vec::with_capacity(tags.len() + labels.len());
-    for &(k, v) in tags {
-        m.push((k, v));
+    f: impl FnOnce(&[(&'static str, &'a str)]) -> R,
+) -> R {
+    const STACK: usize = 16;
+    let total = tags.len() + labels.len();
+    if total <= STACK {
+        let mut buf: [(&'static str, &'a str); STACK] = [("", ""); STACK];
+        buf[..tags.len()].copy_from_slice(tags);
+        buf[tags.len()..total].copy_from_slice(labels);
+        f(&buf[..total])
+    } else {
+        let mut v = Vec::with_capacity(total);
+        v.extend_from_slice(tags);
+        v.extend_from_slice(labels);
+        f(&v)
     }
-    m.extend_from_slice(labels);
-    m
 }
 
 // --- Formatting ---

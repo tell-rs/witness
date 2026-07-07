@@ -7,9 +7,10 @@
 //! - **Files tracked by (dev, inode)**, not path. This is the key to correct
 //!   rotation handling — when logrotate renames syslog→syslog.1, we keep
 //!   reading the OLD inode to EOF before switching.
-//! - **Retained file descriptors** — on rename rotation, we hold the old fd open
-//!   and drain it to EOF. This works because the kernel keeps the file alive as
-//!   long as an fd is open, even after the path is unlinked or renamed.
+//! - **Retained file descriptors** — on rename rotation, we locate the rotated
+//!   file by inode (common suffixes, then a directory scan), open it, and hold
+//!   that fd until it is drained to EOF. The kernel keeps the file alive as
+//!   long as the fd is open, even if the path is unlinked meanwhile.
 //! - **Partial line buffering** — hold bytes until a newline delimiter is seen.
 //!   Prevents emitting truncated lines when reading mid-write.
 //! - **Atomic checkpoints** — write → fsync → rename for crash safety.
@@ -19,6 +20,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
+
+use tracing::{info, warn};
 
 use crate::sink::Sink;
 
@@ -34,8 +37,10 @@ const OFFSET_SAVE_SECS: u64 = 10;
 const STALE_THRESHOLD: u32 = 30;
 /// Skip files not modified in this many seconds during discovery (24h).
 const IGNORE_OLDER_SECS: u64 = 86400;
-/// Evict files with no new data for this many seconds (1h).
-const IDLE_EVICT_SECS: u64 = 3600;
+/// Minimum seconds between offset saves while actively shipping data.
+/// Bounds fsync frequency during catch-up; the crash-recovery duplicate
+/// window stays at most this long.
+const OFFSET_SAVE_MIN_SECS: u64 = 1;
 /// Maximum partial line buffer size (1 MB). Lines longer than this are truncated
 /// to prevent OOM from binary/malformed log files.
 const MAX_PARTIAL_BYTES: usize = 1024 * 1024;
@@ -101,8 +106,6 @@ pub(crate) struct TailedFile {
     pub(crate) open_failures: u32,
     /// Retained file descriptor for draining after rotation.
     pub(crate) retained_fd: Option<File>,
-    /// Last time new data was read from this file (for idle eviction).
-    pub(crate) last_active: Instant,
 }
 
 // --- Main loop ---
@@ -121,14 +124,15 @@ pub async fn tail_files(
 
     // Initial discovery
     for path in resolve_globs(patterns) {
-        register_file(&mut files, &mut path_index, &path, &saved);
+        register_file(&mut files, &mut path_index, &path, &saved, None);
     }
 
     if files.is_empty() {
-        eprintln!("tail: no files matched configured patterns");
+        warn!("tail: no files matched configured patterns");
     }
 
     let mut poll_interval_ms = POLL_BASE_MS;
+    let mut last_save = Instant::now();
     let mut glob_interval = tokio::time::interval(std::time::Duration::from_secs(GLOB_RESCAN_SECS));
     let mut save_interval = tokio::time::interval(std::time::Duration::from_secs(OFFSET_SAVE_SECS));
     glob_interval.tick().await;
@@ -143,30 +147,31 @@ pub async fn tail_files(
                 // Fast catchup when data is flowing, backoff when idle
                 if total_bytes > 0 {
                     // Use fast poll when actively draining to maximize throughput.
-                    // 50ms polls * 8,000 lines/poll = ~160K lines/sec sustained.
+                    // 50ms polls * 32,000 lines/poll bounds the per-cycle work.
                     poll_interval_ms = POLL_CATCHUP_MS;
-                    // Save offsets immediately after shipping lines to minimize
-                    // the duplicate window on crash recovery (~250ms vs ~10s).
-                    save_offsets(&files);
+                    // Save offsets soon after shipping lines to keep the crash
+                    // duplicate window small, but rate-limit the fsync so a
+                    // catch-up burst doesn't hit the disk every 50ms.
+                    if last_save.elapsed().as_secs() >= OFFSET_SAVE_MIN_SECS {
+                        save_offsets(&files);
+                        last_save = Instant::now();
+                    }
                 } else {
                     // No data — back off to reduce CPU when idle
                     poll_interval_ms = (poll_interval_ms * 2).min(POLL_MAX_MS);
                 }
 
-                // Clean up: deleted files (open failures) + idle files (no data for 1h)
-                let now = Instant::now();
+                // Clean up entries whose file disappeared (repeated open failures)
                 let removable: Vec<FileId> = files.iter()
-                    .filter(|(_, f)| {
-                        let is_stale = f.open_failures >= STALE_THRESHOLD && f.retained_fd.is_none();
-                        let is_idle = now.duration_since(f.last_active).as_secs() > IDLE_EVICT_SECS;
-                        is_stale || is_idle
-                    })
+                    .filter(|(_, f)| f.open_failures >= STALE_THRESHOLD && f.retained_fd.is_none())
                     .map(|(&id, _)| id)
                     .collect();
                 for id in removable {
                     if let Some(f) = files.remove(&id) {
-                        path_index.remove(&f.path);
-                        eprintln!("tail: evicted {}", f.path.display());
+                        if path_index.get(&f.path) == Some(&f.id) {
+                            path_index.remove(&f.path);
+                        }
+                        info!(path = %f.path.display(), "tail: evicted");
                     }
                 }
             }
@@ -175,8 +180,8 @@ pub async fn tail_files(
             _ = glob_interval.tick() => {
                 for path in resolve_globs(patterns) {
                     if !path_index.contains_key(&path) {
-                        register_file(&mut files, &mut path_index, &path, &HashMap::new());
-                        eprintln!("tail: discovered {}", path.display());
+                        register_file(&mut files, &mut path_index, &path, &HashMap::new(), None);
+                        info!(path = %path.display(), "tail: discovered");
                     }
                 }
             }
@@ -184,6 +189,7 @@ pub async fn tail_files(
             // Persist offsets
             _ = save_interval.tick() => {
                 save_offsets(&files);
+                last_save = Instant::now();
             }
 
             // Shutdown
@@ -202,11 +208,15 @@ pub async fn tail_files(
 
 // --- File registration ---
 
+/// Track a file. `initial_pos` overrides the starting offset — `Some(0)` for
+/// files that replace a rotated one (their entire content is new data);
+/// `None` for discovery, which resumes from a saved offset or tails from EOF.
 pub(crate) fn register_file(
     files: &mut HashMap<FileId, TailedFile>,
     path_index: &mut HashMap<PathBuf, FileId>,
     path: &Path,
     saved: &HashMap<String, SavedOffset>,
+    initial_pos: Option<u64>,
 ) {
     let Ok(metadata) = std::fs::metadata(path) else {
         return;
@@ -226,8 +236,10 @@ pub(crate) fn register_file(
         .get(&path.to_string_lossy().to_string())
         .is_some_and(|s| s.dev == id.dev && s.ino == id.ino);
 
-    // Skip files not modified recently (unless we have a checkpoint for them)
-    if !has_checkpoint
+    // Skip files not modified recently (unless we have a checkpoint for them,
+    // or they replace a rotated file and must be read from the start)
+    if initial_pos.is_none()
+        && !has_checkpoint
         && let Ok(modified) = metadata.modified()
         && let Ok(age) = SystemTime::now().duration_since(modified)
         && age.as_secs() > IGNORE_OLDER_SECS
@@ -235,11 +247,13 @@ pub(crate) fn register_file(
         return;
     }
 
-    let pos = saved
-        .get(&path.to_string_lossy().to_string())
-        .filter(|s| s.dev == id.dev && s.ino == id.ino)
-        .map(|s| s.pos.min(metadata.len()))
-        .unwrap_or(metadata.len());
+    let pos = initial_pos.unwrap_or_else(|| {
+        saved
+            .get(&path.to_string_lossy().to_string())
+            .filter(|s| s.dev == id.dev && s.ino == id.ino)
+            .map(|s| s.pos.min(metadata.len()))
+            .unwrap_or(metadata.len())
+    });
 
     path_index.insert(path.to_path_buf(), id);
     files.insert(
@@ -251,7 +265,6 @@ pub(crate) fn register_file(
             partial: String::new(),
             open_failures: 0,
             retained_fd: None,
-            last_active: Instant::now(),
         },
     );
 }
@@ -274,15 +287,23 @@ fn poll_all(
             continue;
         };
 
-        // First: drain any retained fd from a previous rotation
+        // Entries with a retained fd are rotated-out files: their only job is
+        // draining to EOF. The path is owned by the new-inode entry registered
+        // at rotation time, so once drained, remove the entry.
         if tailed.retained_fd.is_some() {
             total_bytes += drain_retained(tailed, sink, parse_syslog);
+            if tailed.retained_fd.is_none()
+                && let Some(f) = files.remove(&id)
+                && path_index.get(&f.path) == Some(&f.id)
+            {
+                path_index.remove(&f.path);
+            }
+            continue;
         }
 
         match check_and_read(tailed, sink, parse_syslog) {
             ReadResult::Bytes(n) => {
                 tailed.open_failures = 0;
-                tailed.last_active = Instant::now();
                 total_bytes += n;
             }
             ReadResult::Rotated { old_fd } => {
@@ -291,10 +312,22 @@ fn poll_all(
                 tailed.retained_fd = Some(old_fd);
                 tailed.open_failures = 0;
 
-                // Register the new file at this path
+                // Register the new file at this path, reading from the start —
+                // everything in it was written after rotation.
                 let path = tailed.path.clone();
+                if path_index.get(&path) == Some(&id) {
+                    path_index.remove(&path);
+                }
+                register_file(files, path_index, &path, &HashMap::new(), Some(0));
+            }
+            ReadResult::RotatedLost => {
+                // Old inode vanished before we could drain it (deleted or
+                // compressed). Accept the loss; track the new file from the
+                // start — everything in it was written after rotation.
+                let path = tailed.path.clone();
+                files.remove(&id);
                 path_index.remove(&path);
-                register_file(files, path_index, &path, &HashMap::new());
+                register_file(files, path_index, &path, &HashMap::new(), Some(0));
             }
             ReadResult::OpenFailed => {
                 tailed.open_failures += 1;
@@ -311,6 +344,8 @@ enum ReadResult {
     Bytes(u64),
     /// Path now points to a different inode. Old fd returned for draining.
     Rotated { old_fd: File },
+    /// Path points to a different inode and the old file cannot be found.
+    RotatedLost,
     /// File could not be opened.
     OpenFailed,
     /// No new data.
@@ -331,38 +366,19 @@ fn check_and_read(tailed: &mut TailedFile, sink: &Sink, parse_syslog: bool) -> R
     #[cfg(not(unix))]
     let current_id = FileId::from_path(&tailed.path);
 
-    // Rotation detected — path now points to a different file.
-    // Return the OLD fd (the one we just opened still points to the old path,
-    // but actually... we opened the NEW path. We need the old file's fd.)
-    //
-    // On Unix, the old file still exists on disk (renamed to syslog.1 or similar).
-    // We can't reopen by old inode directly. But we can open `/proc/self/fd/N`...
-    // Actually, we don't have the old fd anymore since we open by path each time.
-    //
-    // The correct approach: open the file FIRST (getting a fd), THEN check if
-    // the fd's inode matches. If it doesn't match, the fd we have IS the new file.
-    // We need to find the old file. It might be at a rotated path (syslog.1).
-    //
-    // Simpler approach that works: since we detected the inode changed, the old
-    // file is likely at a rotated path. We try common rotation suffixes to find it
-    // and read remaining lines.
+    // Rotation detected — the path now points to a different inode, so the
+    // fd we just opened is the NEW file. We open by path each poll, so we
+    // never held the old file's fd; find the rotated original by inode
+    // (common suffixes like `.1`, then a directory scan) and hand its fd to
+    // the caller for draining. The caller registers the new file separately.
     if current_id != tailed.id {
         flush_partial(tailed, sink);
 
-        // Try to find and open the old file at common rotated paths
         if let Some(old_fd) = find_rotated_file(tailed) {
             return ReadResult::Rotated { old_fd };
         }
 
-        // Can't find old file — accept the loss, switch to new file
-        tailed.id = current_id;
-        tailed.pos = 0;
-        let bytes = read_lines(file, tailed, sink, parse_syslog);
-        return if bytes > 0 {
-            ReadResult::Bytes(bytes)
-        } else {
-            ReadResult::Idle
-        };
+        return ReadResult::RotatedLost;
     }
 
     let current_len = metadata.len();
@@ -436,6 +452,11 @@ pub(crate) fn find_rotated_file(tailed: &TailedFile) -> Option<File> {
 }
 
 /// Drain remaining lines from a retained fd (old file after rotation).
+///
+/// Honors backpressure and the per-poll line cap like the live read path:
+/// when the SDK channel is full or the cap is hit, the fd is put back and
+/// draining resumes from `pos` on the next poll. On EOF the fd is dropped
+/// and the caller removes the entry.
 pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, parse_syslog: bool) -> u64 {
     let Some(file) = tailed.retained_fd.take() else {
         return 0;
@@ -447,6 +468,7 @@ pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, parse_syslog:
     }
 
     let mut bytes_read = 0u64;
+    let mut lines_emitted = 0usize;
     let mut buf = Vec::new();
 
     loop {
@@ -454,18 +476,28 @@ pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, parse_syslog:
         match reader.read_until(b'\n', &mut buf) {
             Ok(0) => break, // EOF — old file fully drained
             Ok(n) => {
-                tailed.pos += n as u64;
-                bytes_read += n as u64;
-
                 if buf.last() == Some(&b'\n') {
-                    emit_line(
+                    if !try_emit_line(
                         &buf[..buf.len() - 1],
                         &mut tailed.partial,
                         sink,
                         parse_syslog,
-                    );
+                    ) {
+                        // Channel full — keep the fd, resume next poll.
+                        tailed.retained_fd = Some(reader.into_inner());
+                        return bytes_read;
+                    }
+                    tailed.pos += n as u64;
+                    bytes_read += n as u64;
+                    lines_emitted += 1;
+                    if lines_emitted >= MAX_LINES_PER_POLL {
+                        tailed.retained_fd = Some(reader.into_inner());
+                        return bytes_read;
+                    }
                 } else {
-                    tailed.partial.push_str(&String::from_utf8_lossy(&buf));
+                    tailed.pos += n as u64;
+                    bytes_read += n as u64;
+                    push_partial(&mut tailed.partial, &buf);
                 }
             }
             Err(_) => break,
@@ -475,12 +507,19 @@ pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, parse_syslog:
     // Flush any remaining partial from the old file
     flush_partial(tailed, sink);
 
-    // Mark as fully drained — the old entry will be cleaned up as stale
-    // since the path now points to the new inode and open will "fail" the
-    // inode check repeatedly.
-    tailed.open_failures = STALE_THRESHOLD;
-
     bytes_read
+}
+
+/// Append bytes to the partial-line buffer, capped at [`MAX_PARTIAL_BYTES`]
+/// on a UTF-8 character boundary (a plain `truncate` can panic mid-char).
+fn push_partial(partial: &mut String, bytes: &[u8]) {
+    if partial.len() >= MAX_PARTIAL_BYTES {
+        return;
+    }
+    partial.push_str(&String::from_utf8_lossy(bytes));
+    if partial.len() > MAX_PARTIAL_BYTES {
+        partial.truncate(partial.floor_char_boundary(MAX_PARTIAL_BYTES));
+    }
 }
 
 /// Read complete lines from the file, buffering partials.
@@ -530,11 +569,8 @@ pub(crate) fn read_lines(
                     // Always advance offset for partials (they're buffered in memory).
                     tailed.pos += n as u64;
                     bytes_read += n as u64;
-                    // Cap at MAX_PARTIAL_BYTES to prevent OOM from binary/malformed files.
-                    if tailed.partial.len() < MAX_PARTIAL_BYTES {
-                        tailed.partial.push_str(&String::from_utf8_lossy(&buf));
-                        tailed.partial.truncate(MAX_PARTIAL_BYTES);
-                    }
+                    // Capped at MAX_PARTIAL_BYTES to prevent OOM from binary/malformed files.
+                    push_partial(&mut tailed.partial, &buf);
                 }
             }
             Err(_) => break,
@@ -597,34 +633,6 @@ pub(crate) fn try_emit_line(
     }
 }
 
-/// Emit a complete line, prepending any buffered partial. Fire-and-forget.
-pub(crate) fn emit_line(line_bytes: &[u8], partial: &mut String, sink: &Sink, parse_syslog: bool) {
-    let line_str = if partial.is_empty() {
-        String::from_utf8_lossy(line_bytes)
-    } else {
-        partial.push_str(&String::from_utf8_lossy(line_bytes));
-        let complete = std::mem::take(partial);
-        std::borrow::Cow::Owned(complete)
-    };
-
-    let trimmed = line_str.trim_end();
-    if !trimmed.is_empty() {
-        if parse_syslog {
-            if let Some(parsed) = super::syslog::parse(trimmed) {
-                sink.log_with_service(
-                    tell::LogLevel::Info,
-                    parsed.body,
-                    None,
-                    Some(parsed.program),
-                    None::<()>,
-                );
-                return;
-            }
-        }
-        sink.log(tell::LogLevel::Info, trimmed, None, None::<()>);
-    }
-}
-
 /// Emit any buffered partial line (called on rotation/shutdown).
 pub(crate) fn flush_partial(tailed: &mut TailedFile, sink: &Sink) {
     if tailed.partial.is_empty() {
@@ -643,7 +651,7 @@ pub(crate) fn flush_partial(tailed: &mut TailedFile, sink: &Sink) {
 pub(crate) fn resolve_globs(patterns: &[String]) -> Vec<PathBuf> {
     let mut result = Vec::new();
     for pattern in patterns {
-        if pattern.contains('*') || pattern.contains('?') {
+        if pattern.contains(['*', '?', '[']) {
             if let Ok(entries) = glob::glob(pattern) {
                 for entry in entries.flatten() {
                     if entry.is_file() {
@@ -682,6 +690,12 @@ pub(crate) fn save_offsets(files: &HashMap<FileId, TailedFile>) {
     let Ok(file) = File::create(&tmp) else {
         return;
     };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
 
     let mut w = std::io::BufWriter::new(file);
     for tailed in files.values() {

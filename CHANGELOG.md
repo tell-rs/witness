@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.3.0
+
+New:
+- logs: journald reading pauses under backpressure instead of dropping entries — nothing is lost when the pipeline is saturated
+- config: reloading with an invalid file keeps the last good config running instead of killing the agent
+- agent: structured stderr logging with severity levels, filtered via RUST_LOG
+- ci: dependency license and vulnerability scanning on every push
+- release: binaries are smoke-tested and the full test suite must pass before publishing
+
+Fix:
+- logs: lines written to a fresh log file right after rotation are no longer skipped
+- logs: files quiet for over an hour no longer lose lines when they become active again
+- logs: a single oversized binary line can no longer crash the tailer
+- logs: draining a rotated file respects backpressure and no longer floods the pipeline in one burst
+- logs: accented and non-Latin characters in quoted logfmt values survive intact
+- logs: offset saves are rate-limited during catch-up, cutting disk sync pressure on busy hosts
+- metrics: a panicking collector recovers and reinitializes instead of taking down the agent in release builds
+- metrics: macOS network throughput stays correct past the 4 GiB interface counter wrap
+- metrics: macOS CPU totals no longer overflow on many-core hosts with long uptimes
+- metrics: macOS memory used no longer spikes to impossible values, and a per-tick kernel resource leak is fixed
+- metrics: container discovery is cached instead of walking the cgroup tree every tick
+- setup: server-fetched config is validated before it is written, and the API token is hidden from the process list
+- install: clear error on non-Linux platforms instead of failing partway through
+
+Breaking:
+- metrics: process CPU is now system.process.cpu_percent, a true percentage — replaces the interval-dependent cpu_jiffies value
+
 ## v0.2.0
 
 New:

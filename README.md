@@ -46,7 +46,7 @@ Reads your log files and forwards every line to your collector. System logs, app
 - **Configurable** — point at specific paths or use glob patterns like `/var/log/nginx/*.log` to match multiple files.
 - **Fast** — 76 ns per log line. Batched and shipped over TCP in the background.
 - **Reliable** — survives rotation, truncation, crashes, and restarts. Every line is delivered at least once — a crash may re-send a few recent lines, but never skips any.
-- **Low overhead** — stale files cleaned up, idle files evicted from memory. No babysitting.
+- **Low overhead** — deleted files cleaned up automatically, per-file state is a few hundred bytes. No babysitting.
 
 ## System Metrics
 
@@ -91,7 +91,7 @@ Log shipping:
 - **Truncation safe.** Detects when a file is emptied and resets to the beginning. No missed lines after the truncation point.
 - **Crash recovery.** File positions saved to disk after every poll cycle. If the agent crashes, it picks up where it left off. A crash may re-send up to ~250ms of recent lines, but never skips any.
 - **Partial line safe.** Incomplete lines are buffered until a newline arrives. A line being written mid-read won't produce garbage.
-- **Memory bounded.** Line buffer capped at 1 MB per file. Binary or malformed files can't grow memory unbounded. Stale files evicted after 24 hours, idle files after 1 hour.
+- **Memory bounded.** Line buffer capped at 1 MB per file. Binary or malformed files can't grow memory unbounded. Deleted files are evicted from tracking; files untouched for 24 hours are skipped at discovery.
 - **Backpressure.** Polling backs off exponentially when files are idle. No CPU burn on quiet servers.
 
 Metrics:
@@ -112,7 +112,8 @@ Vector was built with minimal features (file source, host metrics, socket sink).
 
 ## Test Coverage
 
-86% line test coverage
+Measured with `cargo llvm-cov` (see TESTING.md for methodology and exclusions).
+Note: platform-gated collectors are only counted on their own platform.
 
 ## License
 

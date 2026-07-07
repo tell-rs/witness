@@ -13,8 +13,28 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Releases must not ship untested code: run the full suite before building,
+  # since tag pushes don't wait for the CI workflow.
+  test:
+    name: Test before release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Test
+        run: cargo nextest run --all --no-fail-fast
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings -A clippy::collapsible_if
+
   build:
     name: Build ${{ matrix.os_arch }}
+    needs: [test]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -57,6 +77,14 @@ jobs:
 
       - name: Build
         run: cargo zigbuild --release --target ${{ matrix.rust_target }}
+
+      # Native-arch runners for both targets — the packaged binary must at
+      # least start and print usage before it ships.
+      - name: Smoke test binary
+        run: |
+          BIN=target/${{ matrix.rust_target }}/release/witness
+          "$BIN" --help
+          "$BIN" setup --help
 
       - name: Package
         run: |

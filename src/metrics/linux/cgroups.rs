@@ -8,17 +8,17 @@ use crate::metrics::{Collector, read_procfs};
 use crate::sink::Sink;
 
 pub struct CgroupCollector {
-    cgroup_path: Option<String>,
-    prev_cpu: Option<CpuStats>,
+    pub(crate) cgroup_path: Option<String>,
+    pub(crate) prev_cpu: Option<CpuStats>,
 }
 
 #[derive(Clone, Default)]
-struct CpuStats {
-    usage_usec: u64,
-    user_usec: u64,
-    system_usec: u64,
-    throttled_usec: u64,
-    nr_throttled: u64,
+pub(crate) struct CpuStats {
+    pub(crate) usage_usec: u64,
+    pub(crate) user_usec: u64,
+    pub(crate) system_usec: u64,
+    pub(crate) throttled_usec: u64,
+    pub(crate) nr_throttled: u64,
 }
 
 impl CgroupCollector {
@@ -114,7 +114,7 @@ impl Collector for CgroupCollector {
     }
 }
 
-fn parse_cpu_stat(buf: &str) -> CpuStats {
+pub(crate) fn parse_cpu_stat(buf: &str) -> CpuStats {
     let mut stats = CpuStats::default();
     for line in buf.lines() {
         let mut parts = line.split_whitespace();

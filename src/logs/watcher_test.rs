@@ -19,7 +19,6 @@ fn make_tailed(path: &std::path::Path) -> TailedFile {
         partial: String::new(),
         open_failures: 0,
         retained_fd: None,
-        last_active: Instant::now(),
     }
 }
 
@@ -77,45 +76,31 @@ fn resolve_globs_skips_directories() {
     assert!(result[0].file_name().unwrap() == "real.log");
 }
 
-// --- emit_line ---
+// --- try_emit_line basics ---
 
 #[test]
-fn emit_line_simple() {
+fn try_emit_line_whitespace_only_skipped() {
     let sink = discard_sink();
     let mut partial = String::new();
-    watcher::emit_line(b"hello world", &mut partial, &sink, false);
+    assert!(watcher::try_emit_line(
+        b"   \t  ",
+        &mut partial,
+        &sink,
+        false
+    ));
     assert!(partial.is_empty());
 }
 
 #[test]
-fn emit_line_with_partial() {
-    let sink = discard_sink();
-    let mut partial = "start of ".to_string();
-    watcher::emit_line(b"line", &mut partial, &sink, false);
-    assert!(partial.is_empty());
-}
-
-#[test]
-fn emit_line_empty_skipped() {
-    let sink = discard_sink();
-    let mut partial = String::new();
-    watcher::emit_line(b"", &mut partial, &sink, false);
-    assert!(partial.is_empty());
-}
-
-#[test]
-fn emit_line_whitespace_only_skipped() {
-    let sink = discard_sink();
-    let mut partial = String::new();
-    watcher::emit_line(b"   \t  ", &mut partial, &sink, false);
-    assert!(partial.is_empty());
-}
-
-#[test]
-fn emit_line_to_dry_run_sink() {
+fn try_emit_line_to_dry_run_sink() {
     let sink = Sink::dry_run(DryRun::new(), Default::default());
     let mut partial = String::new();
-    watcher::emit_line(b"log message here", &mut partial, &sink, false);
+    assert!(watcher::try_emit_line(
+        b"log message here",
+        &mut partial,
+        &sink,
+        false,
+    ));
     assert!(partial.is_empty());
 }
 
@@ -226,7 +211,7 @@ fn register_file_new() {
     let mut path_index = HashMap::new();
     let saved = HashMap::new();
 
-    watcher::register_file(&mut files, &mut path_index, &path, &saved);
+    watcher::register_file(&mut files, &mut path_index, &path, &saved, None);
 
     assert_eq!(files.len(), 1);
     assert_eq!(path_index.len(), 1);
@@ -257,7 +242,7 @@ fn register_file_with_saved_offset() {
     let mut files = HashMap::new();
     let mut path_index = HashMap::new();
 
-    watcher::register_file(&mut files, &mut path_index, &path, &saved);
+    watcher::register_file(&mut files, &mut path_index, &path, &saved, None);
 
     let tailed = files.values().next().unwrap();
     assert_eq!(tailed.pos, 5); // Resumes from saved offset
@@ -285,7 +270,7 @@ fn register_file_saved_offset_clamped_to_file_len() {
     let mut files = HashMap::new();
     let mut path_index = HashMap::new();
 
-    watcher::register_file(&mut files, &mut path_index, &path, &saved);
+    watcher::register_file(&mut files, &mut path_index, &path, &saved, None);
 
     let tailed = files.values().next().unwrap();
     assert_eq!(tailed.pos, 5); // Clamped to file length
@@ -301,8 +286,8 @@ fn register_file_duplicate_ignored() {
     let mut path_index = HashMap::new();
     let saved = HashMap::new();
 
-    watcher::register_file(&mut files, &mut path_index, &path, &saved);
-    watcher::register_file(&mut files, &mut path_index, &path, &saved);
+    watcher::register_file(&mut files, &mut path_index, &path, &saved, None);
+    watcher::register_file(&mut files, &mut path_index, &path, &saved, None);
 
     assert_eq!(files.len(), 1); // Still just one entry
 }
@@ -318,6 +303,7 @@ fn register_file_nonexistent_ignored() {
         &mut path_index,
         std::path::Path::new("/tmp/tell_test_does_not_exist.log"),
         &saved,
+        None,
     );
 
     assert!(files.is_empty());
@@ -347,7 +333,6 @@ fn find_rotated_file_with_suffix() {
         partial: String::new(),
         open_failures: 0,
         retained_fd: None,
-        last_active: Instant::now(),
     };
 
     let found = watcher::find_rotated_file(&tailed);
@@ -370,7 +355,6 @@ fn find_rotated_file_not_found() {
         partial: String::new(),
         open_failures: 0,
         retained_fd: None,
-        last_active: Instant::now(),
     };
 
     let found = watcher::find_rotated_file(&tailed);
@@ -394,7 +378,6 @@ fn drain_retained_reads_remaining_lines() {
         partial: String::new(),
         open_failures: 0,
         retained_fd: Some(fd),
-        last_active: Instant::now(),
     };
 
     let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), false);
@@ -430,7 +413,6 @@ fn drain_retained_with_partial_line() {
         partial: String::new(),
         open_failures: 0,
         retained_fd: Some(fd),
-        last_active: Instant::now(),
     };
 
     let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), false);
@@ -882,42 +864,24 @@ fn bench_read_lines_throughput() {
 // --- Syslog integration ---
 
 #[test]
-fn emit_line_syslog_parsed() {
-    let sink = discard_sink();
-    let mut partial = String::new();
-    let line = b"Apr 12 23:50:00 host sshd[1234]: Connection accepted from 10.0.0.1";
-    watcher::emit_line(line, &mut partial, &sink, true);
-    assert!(partial.is_empty());
-}
-
-#[test]
-fn emit_line_syslog_fallback_non_syslog() {
-    // Non-syslog line with parse_syslog=true falls through to regular log()
-    let sink = discard_sink();
-    let mut partial = String::new();
-    watcher::emit_line(
-        b"plain log message no colon pattern",
-        &mut partial,
-        &sink,
-        true,
-    );
-    assert!(partial.is_empty());
-}
-
-#[test]
-fn emit_line_syslog_with_partial() {
+fn try_emit_line_syslog_with_partial_succeeds() {
     // Partial from a previous read gets assembled into a valid syslog line
     let sink = discard_sink();
     let mut partial = "Apr 12 23:50:00 host sshd[1234".to_string();
-    watcher::emit_line(b"]: Connection accepted", &mut partial, &sink, true);
+    assert!(watcher::try_emit_line(
+        b"]: Connection accepted",
+        &mut partial,
+        &sink,
+        true,
+    ));
     assert!(partial.is_empty());
 }
 
 #[test]
-fn emit_line_syslog_empty_skipped() {
+fn try_emit_line_syslog_empty_skipped() {
     let sink = discard_sink();
     let mut partial = String::new();
-    watcher::emit_line(b"", &mut partial, &sink, true);
+    assert!(watcher::try_emit_line(b"", &mut partial, &sink, true));
     assert!(partial.is_empty());
 }
 
@@ -1019,4 +983,73 @@ fn read_lines_syslog_mixed_formats() {
     let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), true);
     assert!(bytes > 0);
     assert!(tailed.partial.is_empty());
+}
+
+// --- rotation & cap regressions ---
+
+#[test]
+fn register_file_rotation_replacement_starts_at_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.log");
+    std::fs::write(&path, "written before registration\n").unwrap();
+
+    let mut files = HashMap::new();
+    let mut path_index = HashMap::new();
+
+    // Some(0): the file replaced a rotated one — all content is new data.
+    watcher::register_file(&mut files, &mut path_index, &path, &HashMap::new(), Some(0));
+
+    let tailed = files.values().next().unwrap();
+    assert_eq!(tailed.pos, 0);
+}
+
+#[test]
+fn drain_retained_backpressure_keeps_fd_and_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.log");
+    std::fs::write(&path, "line one\nline two\n").unwrap();
+    let file_len = std::fs::metadata(&path).unwrap().len();
+
+    let fd = std::fs::File::open(&path).unwrap();
+    let mut tailed = TailedFile {
+        path,
+        pos: 0,
+        id: FileId { dev: 0, ino: 0 },
+        partial: String::new(),
+        open_failures: 0,
+        retained_fd: Some(fd),
+    };
+
+    // Full channel: nothing shipped, fd kept for the next poll.
+    let bytes = watcher::drain_retained(&mut tailed, &full_sink(), false);
+    assert_eq!(bytes, 0);
+    assert_eq!(tailed.pos, 0);
+    assert!(tailed.retained_fd.is_some());
+
+    // Channel drained: everything ships, fd consumed.
+    let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), false);
+    assert_eq!(bytes, file_len);
+    assert_eq!(tailed.pos, file_len);
+    assert!(tailed.retained_fd.is_none());
+}
+
+#[test]
+fn read_lines_partial_cap_multibyte_boundary_no_panic() {
+    const CAP: usize = 1024 * 1024; // MAX_PARTIAL_BYTES
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("binary.log");
+
+    // A single huge line (no newline) whose byte at the 1 MB cap falls inside
+    // a multi-byte UTF-8 character. A byte-index truncate would panic here.
+    let mut data = vec![b'a'; CAP - 1];
+    data.extend_from_slice("ééé".as_bytes());
+    std::fs::write(&path, &data).unwrap();
+
+    let mut tailed = make_tailed(&path);
+    let file = std::fs::File::open(&path).unwrap();
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), false);
+
+    assert_eq!(bytes, data.len() as u64);
+    assert!(tailed.partial.len() <= CAP);
 }

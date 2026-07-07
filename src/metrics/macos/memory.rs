@@ -26,7 +26,14 @@ impl Collector for MemoryCollector {
 
         if let Some(t) = total {
             sink.gauge("system.memory.total", t as f64, &[]);
-            sink.gauge("system.memory.used", (t - available) as f64, &[]);
+            // `available` is derived from page counts that can momentarily
+            // exceed `hw.memsize` (purgeable overlaps inactive) — saturate
+            // instead of wrapping to ~1.8e19.
+            sink.gauge(
+                "system.memory.used",
+                t.saturating_sub(available) as f64,
+                &[],
+            );
         }
         sink.gauge("system.memory.available", available as f64, &[]);
         sink.gauge("system.memory.cached", cached as f64, &[]);
@@ -101,7 +108,7 @@ fn read_vm_stats() -> Option<VmStats> {
     let mut stats = std::mem::MaybeUninit::<VmStats>::zeroed();
     let mut count = (std::mem::size_of::<VmStats>() / std::mem::size_of::<i32>()) as u32;
 
-    let host = unsafe { mach2::mach_init::mach_host_self() };
+    let host = super::host_port();
     let ret =
         unsafe { host_statistics64(host, HOST_VM_INFO64, stats.as_mut_ptr().cast(), &mut count) };
 

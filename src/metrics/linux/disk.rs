@@ -107,21 +107,30 @@ fn collect_diskstats(
     filter: &DeviceFilter,
 ) {
     for line in buf.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 14 {
-            continue;
-        }
-
-        let name = parts[2];
+        // /proc/diskstats: major minor NAME reads _ sectors_read _ writes _
+        // sectors_written ... — parse off the iterator, no per-line Vec.
+        let mut it = line.split_whitespace();
+        let Some(name) = it.nth(2) else { continue };
         if !filter.allows(name) {
             continue;
         }
 
+        // Fields 4..=14 relative to the line (11 tokens after the name).
+        let mut counters = [0u64; 11];
+        let mut n = 0;
+        for (i, tok) in it.take(11).enumerate() {
+            counters[i] = tok.parse().unwrap_or(0);
+            n = i + 1;
+        }
+        if n < 11 {
+            continue;
+        }
+
         let current = DiskStats {
-            reads_completed: parts[3].parse().unwrap_or(0),
-            sectors_read: parts[5].parse().unwrap_or(0),
-            writes_completed: parts[7].parse().unwrap_or(0),
-            sectors_written: parts[9].parse().unwrap_or(0),
+            reads_completed: counters[0],
+            sectors_read: counters[2],
+            writes_completed: counters[4],
+            sectors_written: counters[6],
         };
 
         if let Some(p) = prev.get_mut(name) {
@@ -208,11 +217,11 @@ impl DiskCollector {
 fn parse_mounts(buf: &str) -> Vec<MountInfo> {
     buf.lines()
         .filter_map(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 3 {
+            let mut it = line.split_whitespace();
+            let (Some(device), Some(mount_point), Some(fs)) = (it.next(), it.next(), it.next())
+            else {
                 return None;
-            }
-            let fs = parts[2];
+            };
             if !matches!(
                 fs,
                 "ext4" | "ext3" | "ext2" | "xfs" | "btrfs" | "zfs" | "vfat" | "ntfs" | "f2fs"
@@ -220,8 +229,8 @@ fn parse_mounts(buf: &str) -> Vec<MountInfo> {
                 return None;
             }
             Some(MountInfo {
-                device: parts[0].to_string(),
-                mount_point: parts[1].to_string(),
+                device: device.to_string(),
+                mount_point: mount_point.to_string(),
             })
         })
         .collect()

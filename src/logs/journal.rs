@@ -13,6 +13,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::watch;
+use tracing::{info, warn};
 
 use crate::sink::Sink;
 
@@ -26,6 +27,11 @@ const CURSOR_SAVE_INTERVAL: usize = 100;
 
 /// Maximum backoff between journalctl restart attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// How long to wait before retrying an entry when the SDK channel is full.
+/// While we wait we stop reading journalctl's stdout, so the pipe (and
+/// journald behind it) becomes the buffer — no entries are dropped.
+const FULL_CHANNEL_RETRY: Duration = Duration::from_millis(100);
 
 /// Our own syslog identifier — filtered to prevent feedback loops.
 const SELF_IDENTIFIER: &str = "witness";
@@ -60,6 +66,19 @@ enum LoopExit {
     Failed(String),
 }
 
+/// Outcome of processing one journal entry.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProcessResult {
+    /// Entry handled — shipped or intentionally filtered. Carries the cursor
+    /// to record, if the entry had one.
+    Handled(Option<String>),
+    /// SDK channel full — entry NOT shipped. Retry the same line; the cursor
+    /// must not advance past it.
+    ChannelFull,
+    /// JSON parse failure.
+    ParseFailed,
+}
+
 /// Mutable state carried across the read loop.
 struct ReaderState {
     last_cursor: Option<String>,
@@ -76,22 +95,43 @@ impl ReaderState {
         }
     }
 
-    fn handle_entry(&mut self, line: &str, sink: &Sink) {
-        match process_entry(line, sink) {
-            Some(cursor) => {
-                if let Some(c) = cursor {
-                    self.last_cursor = Some(c);
+    /// Process one entry, waiting out SDK backpressure.
+    ///
+    /// Returns `false` if cancellation arrived while waiting for channel
+    /// capacity — the entry was not shipped and the cursor was not advanced.
+    async fn handle_entry(
+        &mut self,
+        line: &str,
+        sink: &Sink,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> bool {
+        loop {
+            match process_entry(line, sink) {
+                ProcessResult::Handled(cursor) => {
+                    if let Some(c) = cursor {
+                        self.last_cursor = Some(c);
+                    }
+                    self.entries_since_save += 1;
+                    if self.entries_since_save >= CURSOR_SAVE_INTERVAL {
+                        save_cursor(self.last_cursor.as_deref());
+                        self.entries_since_save = 0;
+                    }
+                    return true;
                 }
-                self.entries_since_save += 1;
-                if self.entries_since_save >= CURSOR_SAVE_INTERVAL {
-                    save_cursor(self.last_cursor.as_deref());
-                    self.entries_since_save = 0;
+                ProcessResult::ChannelFull => {
+                    // Stop reading until the SDK drains — the journalctl pipe
+                    // (and journald) buffer for us, so nothing is lost.
+                    tokio::select! {
+                        _ = tokio::time::sleep(FULL_CHANNEL_RETRY) => {}
+                        _ = cancel.changed() => return false,
+                    }
                 }
-            }
-            None => {
-                self.dropped += 1;
-                if self.dropped.is_power_of_two() {
-                    eprintln!("WARNING: {} journal entries failed to parse", self.dropped);
+                ProcessResult::ParseFailed => {
+                    self.dropped += 1;
+                    if self.dropped.is_power_of_two() {
+                        warn!(dropped = self.dropped, "journal entries failed to parse");
+                    }
+                    return true;
                 }
             }
         }
@@ -119,7 +159,7 @@ pub async fn tail_journal(sink: Sink, mut cancel: watch::Receiver<bool>) {
                 if *cancel.borrow() {
                     break;
                 }
-                eprintln!("WARNING: journalctl exited ({reason}), retrying in {backoff:?}");
+                warn!(?backoff, "journalctl exited ({reason}), retrying");
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = cancel.changed() => break,
@@ -128,7 +168,7 @@ pub async fn tail_journal(sink: Sink, mut cancel: watch::Receiver<bool>) {
             }
         }
     }
-    eprintln!("journal watcher stopped");
+    info!("journal watcher stopped");
 }
 
 /// Check if journalctl is available on this system.
@@ -147,9 +187,9 @@ pub fn is_available() -> bool {
 /// or cancellation is received.
 async fn run_journalctl(sink: &Sink, cancel: &mut watch::Receiver<bool>) -> LoopExit {
     let cursor = load_cursor();
-    eprintln!(
-        "journal watcher starting (cursor: {})",
-        cursor.as_deref().unwrap_or("(none)")
+    info!(
+        cursor = cursor.as_deref().unwrap_or("(none)"),
+        "journal watcher starting"
     );
 
     let mut child = match spawn_journalctl(cursor.as_deref()) {
@@ -180,7 +220,13 @@ async fn run_journalctl(sink: &Sink, cancel: &mut watch::Receiver<bool>) -> Loop
                         return LoopExit::Failed("stream ended".into());
                     }
                     Ok(n) if n > MAX_LINE_LEN => continue,
-                    Ok(_) => state.handle_entry(&line_buf, sink),
+                    Ok(_) => {
+                        if !state.handle_entry(&line_buf, sink, cancel).await {
+                            // Cancelled while waiting out backpressure.
+                            let _ = child.kill().await;
+                            break;
+                        }
+                    }
                     Err(e) => {
                         state.save_final();
                         let _ = child.wait().await;
@@ -216,19 +262,21 @@ fn spawn_journalctl(cursor: Option<&str>) -> Result<tokio::process::Child, std::
 
 /// Process a single JSON journal entry.
 ///
-/// Returns `Some(cursor)` if parsing succeeded (entry may or may not have
-/// been shipped — filtered/empty entries still advance the cursor).
-/// Returns `None` on JSON parse failure.
-pub(crate) fn process_entry(json_line: &str, sink: &Sink) -> Option<Option<String>> {
-    let entry: JournalEntry = serde_json::from_str(json_line.trim()).ok()?;
+/// Filtered/empty entries count as handled and still advance the cursor.
+/// When the SDK channel is full the entry is not shipped and the caller
+/// must retry the same line without advancing the cursor.
+pub(crate) fn process_entry(json_line: &str, sink: &Sink) -> ProcessResult {
+    let Ok(entry) = serde_json::from_str::<JournalEntry>(json_line.trim()) else {
+        return ProcessResult::ParseFailed;
+    };
 
     let cursor = entry.cursor;
 
     let Some(ref message) = entry.message else {
-        return Some(cursor);
+        return ProcessResult::Handled(cursor);
     };
     if message.is_empty() {
-        return Some(cursor);
+        return ProcessResult::Handled(cursor);
     }
 
     let program = entry
@@ -240,7 +288,7 @@ pub(crate) fn process_entry(json_line: &str, sink: &Sink) -> Option<Option<Strin
     // Filter our own entries to prevent feedback loops.
     // witness logs to journal via systemd, and we'd read those back.
     if program == SELF_IDENTIFIER {
-        return Some(cursor);
+        return ProcessResult::Handled(cursor);
     }
 
     let level = entry
@@ -259,9 +307,11 @@ pub(crate) fn process_entry(json_line: &str, sink: &Sink) -> Option<Option<Strin
     // either direction the result is one flat structured payload.
     let payload = merge_payloads(entry.extras, parsed_fields);
 
-    sink.log_with_service(level, &body, None, Some(program), payload);
+    if !sink.try_log_with_service(level, &body, None, Some(program), payload) {
+        return ProcessResult::ChannelFull;
+    }
 
-    Some(cursor)
+    ProcessResult::Handled(cursor)
 }
 
 /// Extract the event phrase (body) and structured fields from MESSAGE.
@@ -367,27 +417,44 @@ fn parse_logfmt_fields(s: &str) -> Vec<(String, String)> {
         }
         let key = s[key_start..i].to_string();
         i += 1; // past '='
-        // Read value: quoted or bare.
+        // Read value: quoted or bare. Copy via `&str` slices between escape
+        // points — never byte-by-byte casts, which would mangle multi-byte
+        // UTF-8 characters. Slice bounds always land on `"` or `\`, which in
+        // valid UTF-8 can only be standalone ASCII bytes.
         let value = if i < bytes.len() && bytes[i] == b'"' {
             i += 1;
             let mut v = String::new();
+            let mut run_start = i;
             while i < bytes.len() && bytes[i] != b'"' {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
                     match bytes[i + 1] {
-                        b'"' => v.push('"'),
-                        b'\\' => v.push('\\'),
-                        b'n' => v.push('\n'),
-                        other => {
-                            v.push('\\');
-                            v.push(other as char);
+                        b'"' => {
+                            v.push_str(&s[run_start..i]);
+                            v.push('"');
+                            i += 2;
+                            run_start = i;
                         }
+                        b'\\' => {
+                            v.push_str(&s[run_start..i]);
+                            v.push('\\');
+                            i += 2;
+                            run_start = i;
+                        }
+                        b'n' => {
+                            v.push_str(&s[run_start..i]);
+                            v.push('\n');
+                            i += 2;
+                            run_start = i;
+                        }
+                        // Unknown escape — keep the backslash and whatever
+                        // follows literally (it may be multi-byte).
+                        _ => i += 1,
                     }
-                    i += 2;
                 } else {
-                    v.push(bytes[i] as char);
                     i += 1;
                 }
             }
+            v.push_str(&s[run_start..i.min(bytes.len())]);
             i += 1; // past closing '"'
             v
         } else {

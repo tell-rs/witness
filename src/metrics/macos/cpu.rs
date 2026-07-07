@@ -15,17 +15,20 @@ pub struct CpuCollector {
     prev: HashMap<String, CpuTicks>,
 }
 
+/// Tick counts held as u64: the kernel reports u32 per core, but the
+/// aggregate "total" sums all cores and would overflow u32 within weeks
+/// on a many-core mostly-idle host.
 #[derive(Clone, Default)]
 struct CpuTicks {
-    user: u32,
-    system: u32,
-    idle: u32,
-    nice: u32,
+    user: u64,
+    system: u64,
+    idle: u64,
+    nice: u64,
 }
 
 impl CpuTicks {
     fn total(&self) -> u64 {
-        self.user as u64 + self.system as u64 + self.idle as u64 + self.nice as u64
+        self.user + self.system + self.idle + self.nice
     }
 }
 
@@ -112,7 +115,7 @@ fn read_cpu_ticks() -> Option<Vec<CpuTicks>> {
     const CPU_STATE_NICE: usize = 3;
     const CPU_STATE_MAX: usize = 4;
 
-    let host = unsafe { mach2::mach_init::mach_host_self() };
+    let host = super::host_port();
     let mut num_cpus: u32 = 0;
     let mut info: *mut i32 = std::ptr::null_mut();
     let mut info_count: u32 = 0;
@@ -127,7 +130,7 @@ fn read_cpu_ticks() -> Option<Vec<CpuTicks>> {
         )
     };
 
-    if ret != KERN_SUCCESS || info.is_null() || num_cpus == 0 {
+    if ret != KERN_SUCCESS || info.is_null() {
         return None;
     }
 
@@ -136,16 +139,16 @@ fn read_cpu_ticks() -> Option<Vec<CpuTicks>> {
         let base = i * CPU_STATE_MAX;
         let ticks = unsafe {
             CpuTicks {
-                user: *info.add(base + CPU_STATE_USER) as u32,
-                system: *info.add(base + CPU_STATE_SYSTEM) as u32,
-                idle: *info.add(base + CPU_STATE_IDLE) as u32,
-                nice: *info.add(base + CPU_STATE_NICE) as u32,
+                user: (*info.add(base + CPU_STATE_USER) as u32).into(),
+                system: (*info.add(base + CPU_STATE_SYSTEM) as u32).into(),
+                idle: (*info.add(base + CPU_STATE_IDLE) as u32).into(),
+                nice: (*info.add(base + CPU_STATE_NICE) as u32).into(),
             }
         };
         cpus.push(ticks);
     }
 
-    // Free the mach-allocated buffer
+    // Free the mach-allocated buffer on every path — including num_cpus == 0.
     unsafe {
         mach2::vm::mach_vm_deallocate(
             mach2::traps::mach_task_self(),
@@ -154,5 +157,5 @@ fn read_cpu_ticks() -> Option<Vec<CpuTicks>> {
         );
     }
 
-    Some(cpus)
+    if cpus.is_empty() { None } else { Some(cpus) }
 }

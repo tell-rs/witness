@@ -1,6 +1,6 @@
 [package]
 name = "witness"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.93"
 description = "Lightweight host monitoring agent for the Tell platform"
@@ -29,8 +29,8 @@ serde_json = "1.0"
 toml = "0.8"
 glob = "0.3"
 libc = "0.2"
-thiserror = "2.0"
-anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
@@ -84,7 +84,9 @@ collapsible_if = "allow"
 codegen-units = 1      # Better cross-crate optimization
 lto = "thin"           # Cross-crate inlining
 opt-level = 3          # Maximum speed
-panic = "abort"
+# panic = "unwind" (default) is load-bearing: the collector loop recovers from
+# a panicking collector via spawn_blocking's JoinError. abort would kill the
+# whole agent on any collector panic.
 strip = true
 
 [profile.bench]
