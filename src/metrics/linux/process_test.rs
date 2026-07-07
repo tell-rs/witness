@@ -139,13 +139,16 @@ fn test_process_collector_respects_top_n_and_emits_valid_labels() {
 
     // First tick seeds `last_collect` / `prev` state — cpu_percent needs a
     // nonzero elapsed duration, so give the second tick a little time to pass.
+    // memory_rss DOES emit on the first tick (it needs no baseline), so the
+    // top-N cap is asserted per tick: only second-tick events are counted.
     collector.collect(&sink, "test-host", &mut buf);
+    let first_tick_events = cap.events().len();
     std::thread::sleep(Duration::from_millis(30));
     collector.collect(&sink, "test-host", &mut buf);
 
     let mut rss_count = 0;
     let mut cpu_count = 0;
-    for event in cap.events() {
+    for event in cap.events().into_iter().skip(first_tick_events) {
         let Recorded::Metric {
             name,
             value,
