@@ -1,6 +1,11 @@
 use super::journal;
-use super::journal::ProcessResult;
+use super::journal::{ProcessResult, ServiceFilter};
 use crate::sink::{DryRun, Sink};
+
+/// No-op service filter for tests that don't exercise service filtering.
+fn nofilter() -> ServiceFilter {
+    ServiceFilter::default()
+}
 
 // --- process_entry ---
 
@@ -9,7 +14,7 @@ fn test_process_entry_valid() {
     let dr = DryRun::new();
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = r#"{"MESSAGE":"Connection accepted","SYSLOG_IDENTIFIER":"sshd","PRIORITY":"6","__CURSOR":"s=abc"}"#;
-    let result = journal::process_entry(json, &sink);
+    let result = journal::process_entry(json, &nofilter(), &sink);
     assert_eq!(result, ProcessResult::Handled(Some("s=abc".to_string())));
     assert_eq!(dr.count(), 1);
 }
@@ -19,7 +24,7 @@ fn test_process_entry_missing_message() {
     let dr = DryRun::new();
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = r#"{"SYSLOG_IDENTIFIER":"sshd","PRIORITY":"6","__CURSOR":"s=abc"}"#;
-    let result = journal::process_entry(json, &sink);
+    let result = journal::process_entry(json, &nofilter(), &sink);
     assert_eq!(result, ProcessResult::Handled(Some("s=abc".to_string())));
     assert_eq!(dr.count(), 0); // Not shipped — no message
 }
@@ -29,7 +34,7 @@ fn test_process_entry_empty_message() {
     let dr = DryRun::new();
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = r#"{"MESSAGE":"","SYSLOG_IDENTIFIER":"sshd","__CURSOR":"s=abc"}"#;
-    let result = journal::process_entry(json, &sink);
+    let result = journal::process_entry(json, &nofilter(), &sink);
     assert_eq!(result, ProcessResult::Handled(Some("s=abc".to_string())));
     assert_eq!(dr.count(), 0);
 }
@@ -39,7 +44,7 @@ fn test_process_entry_filters_witness() {
     let dr = DryRun::new();
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = r#"{"MESSAGE":"journal watcher starting","SYSLOG_IDENTIFIER":"witness","PRIORITY":"6","__CURSOR":"s=abc"}"#;
-    let result = journal::process_entry(json, &sink);
+    let result = journal::process_entry(json, &nofilter(), &sink);
     assert_eq!(result, ProcessResult::Handled(Some("s=abc".to_string())));
     assert_eq!(dr.count(), 0); // Filtered — not shipped
 }
@@ -48,7 +53,7 @@ fn test_process_entry_filters_witness() {
 fn test_process_entry_malformed_json() {
     let sink = Sink::discard();
     assert_eq!(
-        journal::process_entry("not json at all", &sink),
+        journal::process_entry("not json at all", &nofilter(), &sink),
         ProcessResult::ParseFailed
     );
 }
@@ -59,7 +64,7 @@ fn test_process_entry_empty_json() {
     let sink = Sink::dry_run(dr.clone(), Default::default());
     // Empty object — no MESSAGE, no cursor
     assert_eq!(
-        journal::process_entry("{}", &sink),
+        journal::process_entry("{}", &nofilter(), &sink),
         ProcessResult::Handled(None)
     );
     assert_eq!(dr.count(), 0);
@@ -70,7 +75,7 @@ fn test_process_entry_no_cursor() {
     let dr = DryRun::new();
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = r#"{"MESSAGE":"hello","SYSLOG_IDENTIFIER":"sshd","PRIORITY":"6"}"#;
-    let result = journal::process_entry(json, &sink);
+    let result = journal::process_entry(json, &nofilter(), &sink);
     assert_eq!(result, ProcessResult::Handled(None)); // Parsed but no cursor
     assert_eq!(dr.count(), 1); // Still shipped
 }
@@ -81,7 +86,7 @@ fn test_process_entry_comm_fallback() {
     let sink = Sink::dry_run(dr.clone(), Default::default());
     // No SYSLOG_IDENTIFIER — falls back to _COMM
     let json = r#"{"MESSAGE":"hello","_COMM":"myapp","PRIORITY":"3","__CURSOR":"s=x"}"#;
-    let result = journal::process_entry(json, &sink);
+    let result = journal::process_entry(json, &nofilter(), &sink);
     assert_eq!(result, ProcessResult::Handled(Some("s=x".to_string())));
     assert_eq!(dr.count(), 1);
 }
@@ -92,7 +97,7 @@ fn test_process_entry_default_priority() {
     let sink = Sink::dry_run(dr.clone(), Default::default());
     // No PRIORITY — defaults to Info
     let json = r#"{"MESSAGE":"hello","SYSLOG_IDENTIFIER":"sshd","__CURSOR":"s=y"}"#;
-    let result = journal::process_entry(json, &sink);
+    let result = journal::process_entry(json, &nofilter(), &sink);
     assert_eq!(result, ProcessResult::Handled(Some("s=y".to_string())));
     assert_eq!(dr.count(), 1);
 }
@@ -104,7 +109,7 @@ fn test_process_entry_ignores_unknown_fields() {
     // systemd-trusted fields (_*) land in extras but are filtered
     // out of the outgoing payload by app_fields_payload.
     let json = r#"{"MESSAGE":"started","SYSLOG_IDENTIFIER":"nginx","_SYSTEMD_UNIT":"nginx.service","_PID":"123","__CURSOR":"s=z"}"#;
-    let result = journal::process_entry(json, &sink);
+    let result = journal::process_entry(json, &nofilter(), &sink);
     assert_eq!(result, ProcessResult::Handled(Some("s=z".to_string())));
     assert_eq!(dr.count(), 1);
 }
@@ -275,7 +280,7 @@ fn test_process_entry_whitespace_trimmed() {
     let dr = DryRun::new();
     let sink = Sink::dry_run(dr.clone(), Default::default());
     let json = "  {\"MESSAGE\":\"hello\",\"SYSLOG_IDENTIFIER\":\"sshd\",\"__CURSOR\":\"s=t\"}  \n";
-    let result = journal::process_entry(json, &sink);
+    let result = journal::process_entry(json, &nofilter(), &sink);
     assert_eq!(result, ProcessResult::Handled(Some("s=t".to_string())));
     assert_eq!(dr.count(), 1);
 }
@@ -333,7 +338,7 @@ fn test_process_entry_channel_full() {
     let sink = Sink::full();
     let json = r#"{"MESSAGE":"hello","SYSLOG_IDENTIFIER":"sshd","__CURSOR":"s=abc"}"#;
     assert_eq!(
-        journal::process_entry(json, &sink),
+        journal::process_entry(json, &nofilter(), &sink),
         ProcessResult::ChannelFull
     );
 }
@@ -345,7 +350,7 @@ fn test_process_entry_channel_full_filtered_still_handled() {
     let sink = Sink::full();
     let json = r#"{"MESSAGE":"x","SYSLOG_IDENTIFIER":"witness","__CURSOR":"s=abc"}"#;
     assert_eq!(
-        journal::process_entry(json, &sink),
+        journal::process_entry(json, &nofilter(), &sink),
         ProcessResult::Handled(Some("s=abc".to_string()))
     );
 }
@@ -371,4 +376,90 @@ fn test_split_message_logfmt_bare_multibyte_value() {
 fn test_split_message_logfmt_escape_adjacent_to_multibyte() {
     let (_, fields) = journal::split_message(r#"evt msg="a\"é\"b""#);
     assert_eq!(fields.unwrap()["msg"], "a\"é\"b");
+}
+
+// --- ServiceFilter (journald parity) ---
+
+fn sshd_line() -> &'static str {
+    r#"{"MESSAGE":"accepted","SYSLOG_IDENTIFIER":"sshd","PRIORITY":"6","__CURSOR":"s=1"}"#
+}
+
+fn cron_line() -> &'static str {
+    r#"{"MESSAGE":"ran job","SYSLOG_IDENTIFIER":"cron","PRIORITY":"6","__CURSOR":"s=2"}"#
+}
+
+#[test]
+fn test_filter_exclude_drops_but_advances_cursor() {
+    let dr = DryRun::new();
+    let sink = Sink::dry_run(dr.clone(), Default::default());
+    let filter = ServiceFilter {
+        include: vec![],
+        exclude: vec!["cron".to_string()],
+    };
+    // Filtered entry is Handled (cursor advances) but not shipped.
+    assert_eq!(
+        journal::process_entry(cron_line(), &filter, &sink),
+        ProcessResult::Handled(Some("s=2".to_string()))
+    );
+    assert_eq!(dr.count(), 0);
+    // A non-excluded service still ships.
+    assert_eq!(
+        journal::process_entry(sshd_line(), &filter, &sink),
+        ProcessResult::Handled(Some("s=1".to_string()))
+    );
+    assert_eq!(dr.count(), 1);
+}
+
+#[test]
+fn test_filter_include_allow_list() {
+    let dr = DryRun::new();
+    let sink = Sink::dry_run(dr.clone(), Default::default());
+    let filter = ServiceFilter {
+        include: vec!["sshd".to_string()],
+        exclude: vec![],
+    };
+    // In the allow-list → shipped.
+    journal::process_entry(sshd_line(), &filter, &sink);
+    assert_eq!(dr.count(), 1);
+    // Not in the allow-list → dropped, cursor still advances.
+    assert_eq!(
+        journal::process_entry(cron_line(), &filter, &sink),
+        ProcessResult::Handled(Some("s=2".to_string()))
+    );
+    assert_eq!(dr.count(), 1);
+}
+
+#[test]
+fn test_filter_empty_include_allows_all() {
+    let dr = DryRun::new();
+    let sink = Sink::dry_run(dr.clone(), Default::default());
+    let filter = ServiceFilter::default();
+    journal::process_entry(sshd_line(), &filter, &sink);
+    journal::process_entry(cron_line(), &filter, &sink);
+    assert_eq!(dr.count(), 2);
+}
+
+#[test]
+fn test_filter_exclude_wins_over_include() {
+    let dr = DryRun::new();
+    let sink = Sink::dry_run(dr.clone(), Default::default());
+    let filter = ServiceFilter {
+        include: vec!["sshd".to_string()],
+        exclude: vec!["sshd".to_string()],
+    };
+    // Present in both lists — exclude wins, dropped.
+    journal::process_entry(sshd_line(), &filter, &sink);
+    assert_eq!(dr.count(), 0);
+}
+
+#[test]
+fn test_filter_case_sensitive_exact() {
+    let dr = DryRun::new();
+    let sink = Sink::dry_run(dr.clone(), Default::default());
+    let filter = ServiceFilter {
+        include: vec![],
+        exclude: vec!["SSHD".to_string()], // wrong case — does not match "sshd"
+    };
+    journal::process_entry(sshd_line(), &filter, &sink);
+    assert_eq!(dr.count(), 1, "exclude is case-sensitive exact");
 }

@@ -65,8 +65,16 @@ async fn collectors_transmit_all_metrics() {
     let client = Tell::new(config).unwrap();
     let sink = Sink::live(client.clone(), Default::default());
 
-    // 3. Initialize the actual macOS collectors
-    let sys_config = SystemConfig::default();
+    // 3. Initialize the actual macOS collectors. macOS defaults collectors OFF
+    //    (spec 003, log-forwarder-first), so enable them explicitly here.
+    let sys_config = SystemConfig {
+        cpu: true,
+        memory: true,
+        load: true,
+        disk: true,
+        network: true,
+        ..SystemConfig::default()
+    };
     let mut all_collectors = metrics::init_collectors(&sys_config);
 
     let names: Vec<&str> = all_collectors.iter().map(|c| c.name()).collect();

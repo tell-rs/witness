@@ -41,6 +41,26 @@ pub fn read_procfs(path: &str, buf: &mut String) -> std::io::Result<()> {
 }
 
 /// Initialize collectors based on config and current platform.
+///
+/// Windows has no metric collectors compiled (log-forwarder-first; metrics stay
+/// OFF by default — spec 006 R1), so this returns empty there.
 pub fn init_collectors(config: &SystemConfig) -> Vec<Box<dyn Collector>> {
-    platform::init_collectors(config)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::init_collectors(config)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = config;
+        Vec::new()
+    }
+}
+
+/// Whether this platform has any metric collectors compiled in at all.
+///
+/// Distinguishes "collectors disabled by config" (macOS default) from
+/// "genuinely unsupported platform" for the dry-run UX (spec 003 R3).
+#[must_use]
+pub fn platform_supported() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }

@@ -6,19 +6,55 @@ use super::watcher;
 use super::watcher::{FileId, SavedOffset, TailedFile};
 use crate::sink::{DryRun, Sink};
 
+use super::structured::FileParseOpts;
+
+/// Plain tailing: no syslog envelope, no structured extraction, no level
+/// detection (the historical `parse_syslog = false` behavior).
+const PLAIN: FileParseOpts = FileParseOpts {
+    syslog: false,
+    structured: false,
+    levels: false,
+};
+
+/// Syslog-envelope parsing only (the historical `parse_syslog = true`
+/// behavior), so the pre-existing syslog assertions stay unchanged.
+const SYSLOG: FileParseOpts = FileParseOpts {
+    syslog: true,
+    structured: false,
+    levels: false,
+};
+
 fn discard_sink() -> Sink {
     Sink::discard()
 }
 
+/// Cross-platform file identity for tests (the production call sites are
+/// platform-split; this mirrors them so the suite compiles on every target).
+fn file_id(path: &std::path::Path) -> FileId {
+    #[cfg(unix)]
+    {
+        FileId::from_metadata(&std::fs::metadata(path).unwrap())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        FileId::from_file(&std::fs::File::open(path).unwrap(), path)
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        FileId::from_path(path)
+    }
+}
+
 fn make_tailed(path: &std::path::Path) -> TailedFile {
-    let meta = std::fs::metadata(path).unwrap();
     TailedFile {
         path: path.to_path_buf(),
         pos: 0,
-        id: FileId::from_metadata(&meta),
+        id: file_id(path),
         partial: String::new(),
         open_failures: 0,
         retained_fd: None,
+        skip_utf16: false,
+        agg: None,
     }
 }
 
@@ -86,7 +122,7 @@ fn try_emit_line_whitespace_only_skipped() {
         b"   \t  ",
         &mut partial,
         &sink,
-        false
+        PLAIN
     ));
     assert!(partial.is_empty());
 }
@@ -99,7 +135,7 @@ fn try_emit_line_to_dry_run_sink() {
         b"log message here",
         &mut partial,
         &sink,
-        false,
+        PLAIN
     ));
     assert!(partial.is_empty());
 }
@@ -153,7 +189,7 @@ fn read_lines_complete_lines() {
 
     let mut tailed = make_tailed(&path);
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), PLAIN);
     assert!(bytes > 0);
     assert_eq!(tailed.pos, bytes);
     assert!(tailed.partial.is_empty());
@@ -168,7 +204,7 @@ fn read_lines_partial_line_buffered() {
 
     let mut tailed = make_tailed(&path);
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), PLAIN);
     assert!(bytes > 0);
     assert_eq!(tailed.partial, "incomplete");
 }
@@ -182,7 +218,7 @@ fn read_lines_from_offset() {
     let mut tailed = make_tailed(&path);
     tailed.pos = 10; // skip "skip this\n"
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), PLAIN);
     assert!(bytes > 0);
     assert_eq!(tailed.pos, 20); // "skip this\n" (10) + "read this\n" (10)
 }
@@ -195,7 +231,7 @@ fn read_lines_empty_file() {
 
     let mut tailed = make_tailed(&path);
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), PLAIN);
     assert_eq!(bytes, 0);
 }
 
@@ -226,8 +262,7 @@ fn register_file_with_saved_offset() {
     let path = dir.path().join("app.log");
     std::fs::write(&path, "0123456789").unwrap();
 
-    let meta = std::fs::metadata(&path).unwrap();
-    let id = FileId::from_metadata(&meta);
+    let id = file_id(&path);
 
     let mut saved = HashMap::new();
     saved.insert(
@@ -254,8 +289,7 @@ fn register_file_saved_offset_clamped_to_file_len() {
     let path = dir.path().join("app.log");
     std::fs::write(&path, "short").unwrap(); // 5 bytes
 
-    let meta = std::fs::metadata(&path).unwrap();
-    let id = FileId::from_metadata(&meta);
+    let id = file_id(&path);
 
     let mut saved = HashMap::new();
     saved.insert(
@@ -318,8 +352,7 @@ fn find_rotated_file_with_suffix() {
     let rotated = dir.path().join("app.log.1");
 
     std::fs::write(&original, "original content\n").unwrap();
-    let original_meta = std::fs::metadata(&original).unwrap();
-    let original_id = FileId::from_metadata(&original_meta);
+    let original_id = file_id(&original);
 
     // Simulate rotation: rename original → .1, create new at original path
     std::fs::rename(&original, &rotated).unwrap();
@@ -333,6 +366,8 @@ fn find_rotated_file_with_suffix() {
         partial: String::new(),
         open_failures: 0,
         retained_fd: None,
+        skip_utf16: false,
+        agg: None,
     };
 
     let found = watcher::find_rotated_file(&tailed);
@@ -355,6 +390,8 @@ fn find_rotated_file_not_found() {
         partial: String::new(),
         open_failures: 0,
         retained_fd: None,
+        skip_utf16: false,
+        agg: None,
     };
 
     let found = watcher::find_rotated_file(&tailed);
@@ -378,9 +415,11 @@ fn drain_retained_reads_remaining_lines() {
         partial: String::new(),
         open_failures: 0,
         retained_fd: Some(fd),
+        skip_utf16: false,
+        agg: None,
     };
 
-    let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), false);
+    let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), PLAIN);
     assert!(bytes > 0);
     assert!(tailed.retained_fd.is_none()); // Consumed
     assert!(tailed.partial.is_empty()); // Flushed
@@ -393,7 +432,7 @@ fn drain_retained_no_fd_returns_zero() {
     std::fs::write(&path, "data\n").unwrap();
 
     let mut tailed = make_tailed(&path);
-    let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), false);
+    let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), PLAIN);
     assert_eq!(bytes, 0);
 }
 
@@ -413,9 +452,11 @@ fn drain_retained_with_partial_line() {
         partial: String::new(),
         open_failures: 0,
         retained_fd: Some(fd),
+        skip_utf16: false,
+        agg: None,
     };
 
-    let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), false);
+    let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), PLAIN);
     assert!(bytes > 0);
     // Partial should be flushed after drain
     assert!(tailed.partial.is_empty());
@@ -436,7 +477,7 @@ async fn tail_files_reads_appended_lines() {
     let handle = tokio::spawn({
         let sink = sink.clone();
         async move {
-            watcher::tail_files(&[pattern], sink, rx, false).await;
+            watcher::tail_files(&[pattern], sink, rx, PLAIN, None).await;
         }
     });
 
@@ -467,7 +508,8 @@ async fn tail_files_no_matching_patterns() {
             &["/tmp/tell_test_nonexistent_*.log".to_string()],
             sink,
             rx,
-            false,
+            PLAIN,
+            None,
         )
         .await;
     });
@@ -489,7 +531,7 @@ async fn tail_files_handles_truncation() {
     let pattern = log_path.to_string_lossy().to_string();
 
     let handle = tokio::spawn(async move {
-        watcher::tail_files(&[pattern], sink, rx, false).await;
+        watcher::tail_files(&[pattern], sink, rx, PLAIN, None).await;
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -513,7 +555,7 @@ async fn tail_files_multiple_patterns() {
     let pattern = format!("{}/*.log", dir.path().display());
 
     let handle = tokio::spawn(async move {
-        watcher::tail_files(&[pattern], sink, rx, false).await;
+        watcher::tail_files(&[pattern], sink, rx, PLAIN, None).await;
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -549,7 +591,7 @@ async fn tail_files_rotation() {
     let pattern = log_path.to_string_lossy().to_string();
 
     let handle = tokio::spawn(async move {
-        watcher::tail_files(&[pattern], sink, rx, false).await;
+        watcher::tail_files(&[pattern], sink, rx, PLAIN, None).await;
     });
 
     // Wait for registration at EOF
@@ -592,7 +634,7 @@ fn try_emit_line_success_no_partial() {
         b"hello world",
         &mut partial,
         &sink,
-        false,
+        PLAIN
     ));
     assert!(partial.is_empty());
 }
@@ -601,7 +643,7 @@ fn try_emit_line_success_no_partial() {
 fn try_emit_line_success_clears_partial() {
     let sink = discard_sink();
     let mut partial = "start of ".to_string();
-    assert!(watcher::try_emit_line(b"line", &mut partial, &sink, false,));
+    assert!(watcher::try_emit_line(b"line", &mut partial, &sink, PLAIN));
     assert!(partial.is_empty());
 }
 
@@ -610,7 +652,7 @@ fn try_emit_line_empty_line_skipped() {
     let sink = full_sink();
     let mut partial = String::new();
     // Empty lines return true (skipped) even when sink is full.
-    assert!(watcher::try_emit_line(b"", &mut partial, &sink, false));
+    assert!(watcher::try_emit_line(b"", &mut partial, &sink, PLAIN));
     assert!(partial.is_empty());
 }
 
@@ -622,7 +664,7 @@ fn try_emit_line_fail_no_partial() {
         b"hello",
         &mut partial,
         &sink,
-        false,
+        PLAIN
     ));
     // Partial must stay empty — we'll re-read from file.
     assert!(partial.is_empty());
@@ -632,7 +674,7 @@ fn try_emit_line_fail_no_partial() {
 fn try_emit_line_fail_preserves_partial() {
     let sink = full_sink();
     let mut partial = "start of ".to_string();
-    assert!(!watcher::try_emit_line(b"line", &mut partial, &sink, false,));
+    assert!(!watcher::try_emit_line(b"line", &mut partial, &sink, PLAIN));
     // Partial must be unchanged so retry re-assembles correctly.
     assert_eq!(partial, "start of ");
 }
@@ -648,12 +690,12 @@ fn try_emit_line_retry_no_partial() {
         b"hello",
         &mut partial,
         &full,
-        false,
+        PLAIN
     ));
     assert!(partial.is_empty());
 
     // Retry with same bytes succeeds — no duplication.
-    assert!(watcher::try_emit_line(b"hello", &mut partial, &ok, false));
+    assert!(watcher::try_emit_line(b"hello", &mut partial, &ok, PLAIN));
     assert!(partial.is_empty());
 }
 
@@ -664,11 +706,11 @@ fn try_emit_line_retry_with_partial() {
     let mut partial = "start of ".to_string();
 
     // Fail — partial must be preserved.
-    assert!(!watcher::try_emit_line(b"line", &mut partial, &full, false,));
+    assert!(!watcher::try_emit_line(b"line", &mut partial, &full, PLAIN));
     assert_eq!(partial, "start of ");
 
     // Retry with same bytes — assembles correctly, no duplication.
-    assert!(watcher::try_emit_line(b"line", &mut partial, &ok, false));
+    assert!(watcher::try_emit_line(b"line", &mut partial, &ok, PLAIN));
     assert!(partial.is_empty());
 }
 
@@ -682,7 +724,7 @@ fn read_lines_backpressure_no_advance() {
 
     let mut tailed = make_tailed(&path);
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &full_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &full_sink(), PLAIN);
 
     // Channel full: nothing should advance.
     assert_eq!(bytes, 0);
@@ -701,13 +743,13 @@ fn read_lines_backpressure_then_resume() {
 
     // Poll 1: full channel — nothing read.
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &full_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &full_sink(), PLAIN);
     assert_eq!(bytes, 0);
     assert_eq!(tailed.pos, 0);
 
     // Poll 2: channel drained — reads everything.
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), PLAIN);
     assert!(bytes > 0);
     assert_eq!(tailed.pos, file_len);
 }
@@ -727,14 +769,14 @@ fn read_lines_backpressure_with_prior_partial() {
 
     // Poll with full channel — assembled "start of line" can't be sent.
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &full_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &full_sink(), PLAIN);
     assert_eq!(bytes, 0);
     assert_eq!(tailed.pos, 10); // Unchanged
     assert_eq!(tailed.partial, "start of "); // Preserved
 
     // Retry — now it works.
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), PLAIN);
     assert!(bytes > 0);
     assert_eq!(tailed.pos, 20); // All consumed: "start of line\nline2\n"
     assert!(tailed.partial.is_empty());
@@ -752,14 +794,14 @@ fn read_lines_backpressure_repeated_retries() {
     // Simulate 5 consecutive full-channel polls.
     for _ in 0..5 {
         let file = std::fs::File::open(&path).unwrap();
-        let bytes = watcher::read_lines(file, &mut tailed, &full_sink(), false);
+        let bytes = watcher::read_lines(file, &mut tailed, &full_sink(), PLAIN);
         assert_eq!(bytes, 0);
         assert_eq!(tailed.pos, 0);
     }
 
     // Now succeed — all 5 lines must come through, no duplication.
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), PLAIN);
     assert_eq!(bytes, file_len);
     assert_eq!(tailed.pos, file_len);
 }
@@ -785,7 +827,7 @@ fn read_lines_stress_100k() {
     // Read in a loop until fully consumed.
     while tailed.pos < file_len {
         let file = std::fs::File::open(&path).unwrap();
-        let bytes = watcher::read_lines(file, &mut tailed, &sink, false);
+        let bytes = watcher::read_lines(file, &mut tailed, &sink, PLAIN);
         assert!(bytes > 0, "stalled at pos {}", tailed.pos);
         polls += 1;
         assert!(polls < 100, "too many polls — infinite loop?");
@@ -830,7 +872,7 @@ fn bench_read_lines_throughput() {
     let mut polls = 0u32;
     while tailed.pos < file_len {
         let file = std::fs::File::open(&path).unwrap();
-        watcher::read_lines(file, &mut tailed, &sink, false);
+        watcher::read_lines(file, &mut tailed, &sink, PLAIN);
         polls += 1;
     }
     let elapsed = start.elapsed();
@@ -851,7 +893,7 @@ fn bench_read_lines_throughput() {
     let mut tailed = make_tailed(&path);
     for _ in 0..100 {
         let file = std::fs::File::open(&path).unwrap();
-        watcher::read_lines(file, &mut tailed, &full, false);
+        watcher::read_lines(file, &mut tailed, &full, PLAIN);
     }
     let bp_elapsed = start.elapsed();
     eprintln!();
@@ -872,7 +914,7 @@ fn try_emit_line_syslog_with_partial_succeeds() {
         b"]: Connection accepted",
         &mut partial,
         &sink,
-        true,
+        SYSLOG
     ));
     assert!(partial.is_empty());
 }
@@ -881,7 +923,7 @@ fn try_emit_line_syslog_with_partial_succeeds() {
 fn try_emit_line_syslog_empty_skipped() {
     let sink = discard_sink();
     let mut partial = String::new();
-    assert!(watcher::try_emit_line(b"", &mut partial, &sink, true));
+    assert!(watcher::try_emit_line(b"", &mut partial, &sink, SYSLOG));
     assert!(partial.is_empty());
 }
 
@@ -890,7 +932,7 @@ fn try_emit_line_syslog_parsed() {
     let sink = discard_sink();
     let mut partial = String::new();
     let line = b"Apr 12 23:50:00 host sshd[1234]: Connection accepted";
-    assert!(watcher::try_emit_line(line, &mut partial, &sink, true));
+    assert!(watcher::try_emit_line(line, &mut partial, &sink, SYSLOG));
     assert!(partial.is_empty());
 }
 
@@ -903,7 +945,7 @@ fn try_emit_line_syslog_non_syslog_falls_through() {
         b"plain message no colon pattern",
         &mut partial,
         &sink,
-        true,
+        SYSLOG
     ));
     assert!(partial.is_empty());
 }
@@ -914,7 +956,7 @@ fn try_emit_line_syslog_full_sink() {
     let sink = full_sink();
     let mut partial = String::new();
     let line = b"Apr 12 23:50:00 host sshd[1234]: Connection accepted";
-    assert!(!watcher::try_emit_line(line, &mut partial, &sink, true));
+    assert!(!watcher::try_emit_line(line, &mut partial, &sink, SYSLOG));
     // Partial stays empty — offset won't advance, file re-read on next poll
     assert!(partial.is_empty());
 }
@@ -928,7 +970,7 @@ fn try_emit_line_syslog_full_sink_with_partial() {
         b"]: Connection accepted",
         &mut partial,
         &sink,
-        true,
+        SYSLOG
     ));
     // Partial must be unchanged so retry re-assembles correctly
     assert_eq!(partial, "Apr 12 23:50:00 host sshd[1234");
@@ -942,11 +984,11 @@ fn try_emit_line_syslog_retry_succeeds() {
     let line = b"Apr 12 23:50:00 host sshd[1234]: Connection accepted";
 
     // First attempt: sink full
-    assert!(!watcher::try_emit_line(line, &mut partial, &full, true));
+    assert!(!watcher::try_emit_line(line, &mut partial, &full, SYSLOG));
     assert!(partial.is_empty());
 
     // Retry: succeeds, no duplication
-    assert!(watcher::try_emit_line(line, &mut partial, &ok, true));
+    assert!(watcher::try_emit_line(line, &mut partial, &ok, SYSLOG));
     assert!(partial.is_empty());
 }
 
@@ -962,7 +1004,7 @@ fn read_lines_syslog_complete_lines() {
 
     let mut tailed = make_tailed(&path);
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), true);
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), SYSLOG);
     assert!(bytes > 0);
     assert!(tailed.partial.is_empty());
 }
@@ -980,7 +1022,7 @@ fn read_lines_syslog_mixed_formats() {
 
     let mut tailed = make_tailed(&path);
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), true);
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), SYSLOG);
     assert!(bytes > 0);
     assert!(tailed.partial.is_empty());
 }
@@ -1018,16 +1060,18 @@ fn drain_retained_backpressure_keeps_fd_and_resumes() {
         partial: String::new(),
         open_failures: 0,
         retained_fd: Some(fd),
+        skip_utf16: false,
+        agg: None,
     };
 
     // Full channel: nothing shipped, fd kept for the next poll.
-    let bytes = watcher::drain_retained(&mut tailed, &full_sink(), false);
+    let bytes = watcher::drain_retained(&mut tailed, &full_sink(), PLAIN);
     assert_eq!(bytes, 0);
     assert_eq!(tailed.pos, 0);
     assert!(tailed.retained_fd.is_some());
 
     // Channel drained: everything ships, fd consumed.
-    let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), false);
+    let bytes = watcher::drain_retained(&mut tailed, &discard_sink(), PLAIN);
     assert_eq!(bytes, file_len);
     assert_eq!(tailed.pos, file_len);
     assert!(tailed.retained_fd.is_none());
@@ -1048,8 +1092,154 @@ fn read_lines_partial_cap_multibyte_boundary_no_panic() {
 
     let mut tailed = make_tailed(&path);
     let file = std::fs::File::open(&path).unwrap();
-    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), false);
+    let bytes = watcher::read_lines(file, &mut tailed, &discard_sink(), PLAIN);
 
     assert_eq!(bytes, data.len() as u64);
     assert!(tailed.partial.len() <= CAP);
+}
+
+// --- fold_file_id (spec 006 R4) ---
+
+#[test]
+fn fold_file_id_ntfs_high_zero_is_low_bits() {
+    // NTFS: high 64 bits zero → ino is the exact low 64 bits (lossless).
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&0x0011_2233_4455_6677u64.to_le_bytes());
+    let fid = watcher::fold_file_id(0xDEAD_BEEF, id);
+    assert_eq!(fid.dev, 0xDEAD_BEEF);
+    assert_eq!(fid.ino, 0x0011_2233_4455_6677);
+}
+
+#[test]
+fn fold_file_id_refs_high_nonzero_is_hashed() {
+    // ReFS: high 64 bits significant → ino is a stable hash of all 16 bytes.
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&1u64.to_le_bytes());
+    id[8..].copy_from_slice(&2u64.to_le_bytes());
+    let a = watcher::fold_file_id(7, id);
+    let b = watcher::fold_file_id(7, id);
+    assert_eq!(a, b, "deterministic");
+    // Not the naive low-bits value, since high bits are significant.
+    assert_ne!(a.ino, 1);
+}
+
+#[test]
+fn fold_file_id_distinct_ids_distinct_fileids() {
+    let mut a = [0u8; 16];
+    a[..8].copy_from_slice(&100u64.to_le_bytes());
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&101u64.to_le_bytes());
+    assert_ne!(watcher::fold_file_id(1, a), watcher::fold_file_id(1, b));
+    // Same id, different volume → different FileId.
+    assert_ne!(watcher::fold_file_id(1, a), watcher::fold_file_id(2, a));
+}
+
+// --- detect_bom (spec 006 R6) ---
+
+#[test]
+fn detect_bom_utf16le() {
+    assert_eq!(
+        watcher::detect_bom(&[0xFF, 0xFE, 0x41, 0x00]),
+        watcher::Bom::Utf16Le
+    );
+    assert!(watcher::detect_bom(&[0xFF, 0xFE]).is_utf16());
+}
+
+#[test]
+fn detect_bom_utf16be() {
+    assert_eq!(
+        watcher::detect_bom(&[0xFE, 0xFF, 0x00, 0x41]),
+        watcher::Bom::Utf16Be
+    );
+    assert!(watcher::detect_bom(&[0xFE, 0xFF]).is_utf16());
+}
+
+#[test]
+fn detect_bom_utf8_not_utf16() {
+    let b = watcher::detect_bom(&[0xEF, 0xBB, 0xBF, b'h', b'i']);
+    assert_eq!(b, watcher::Bom::Utf8);
+    assert!(!b.is_utf16(), "UTF-8 BOM must not be mistaken for UTF-16");
+}
+
+#[test]
+fn detect_bom_none() {
+    assert_eq!(watcher::detect_bom(b"plain ascii"), watcher::Bom::None);
+    assert_eq!(watcher::detect_bom(&[]), watcher::Bom::None);
+    assert_eq!(watcher::detect_bom(&[0xFF]), watcher::Bom::None);
+}
+
+// --- CRLF + UTF-8 BOM handling in try_emit_line (spec 006 R5/R6) ---
+
+fn capture_sink() -> (crate::sink::Capture, Sink) {
+    let cap = crate::sink::Capture::new();
+    (cap.clone(), Sink::capture(cap, Default::default()))
+}
+
+fn shipped_bodies(cap: &crate::sink::Capture) -> Vec<String> {
+    cap.events()
+        .into_iter()
+        .filter_map(|e| match e {
+            crate::sink::Recorded::Log { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn try_emit_line_strips_trailing_cr() {
+    let (cap, sink) = capture_sink();
+    let mut partial = String::new();
+    // The caller passes the line WITHOUT the '\n'; a CRLF line leaves a '\r'.
+    assert!(watcher::try_emit_line(
+        b"hello world\r",
+        &mut partial,
+        &sink,
+        PLAIN
+    ));
+    assert_eq!(shipped_bodies(&cap), vec!["hello world"]);
+}
+
+#[test]
+fn try_emit_line_strips_leading_utf8_bom() {
+    let (cap, sink) = capture_sink();
+    let mut partial = String::new();
+    let mut line = vec![0xEF, 0xBB, 0xBF];
+    line.extend_from_slice(b"first line\r");
+    assert!(watcher::try_emit_line(&line, &mut partial, &sink, PLAIN));
+    assert_eq!(shipped_bodies(&cap), vec!["first line"]);
+}
+
+#[test]
+fn read_lines_crlf_offset_counts_full_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crlf.log");
+    // Mixed \r\n and \n line endings.
+    std::fs::write(&path, "alpha\r\nbeta\ngamma\r\n").unwrap();
+
+    let (cap, sink) = capture_sink();
+    let mut tailed = make_tailed(&path);
+    let file = std::fs::File::open(&path).unwrap();
+    let bytes = watcher::read_lines(file, &mut tailed, &sink, PLAIN);
+
+    // Every body clean (no trailing \r), offset advanced by the FULL byte
+    // length including \r\n.
+    assert_eq!(shipped_bodies(&cap), vec!["alpha", "beta", "gamma"]);
+    assert_eq!(bytes, 19);
+    assert_eq!(tailed.pos, 19);
+}
+
+#[test]
+fn read_lines_skips_nothing_for_utf8_bom_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bom.log");
+    let mut data = vec![0xEF, 0xBB, 0xBF];
+    data.extend_from_slice(b"line one\r\nline two\r\n");
+    std::fs::write(&path, &data).unwrap();
+
+    let (cap, sink) = capture_sink();
+    let mut tailed = make_tailed(&path);
+    let file = std::fs::File::open(&path).unwrap();
+    watcher::read_lines(file, &mut tailed, &sink, PLAIN);
+    // UTF-8 BOM stripped from the first body; both lines shipped clean.
+    assert_eq!(shipped_bodies(&cap), vec!["line one", "line two"]);
 }

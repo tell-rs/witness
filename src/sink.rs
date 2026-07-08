@@ -339,9 +339,7 @@ impl Sink {
             SinkInner::Live(tell) => tell.log(level, message, component, data),
             SinkInner::DryRun(dr) => {
                 dr.counter.fetch_add(1, Ordering::Relaxed);
-                let comp = component.unwrap_or("-");
-                let msg = &message[..message.floor_char_boundary(120)];
-                eprintln!("  log     [{comp}] {msg}");
+                dry_run_log(level, component.unwrap_or("-"), message, data);
             }
             SinkInner::Discard => {}
             #[cfg(test)]
@@ -363,9 +361,7 @@ impl Sink {
             SinkInner::Live(tell) => tell.try_log(level, message, component, data),
             SinkInner::DryRun(dr) => {
                 dr.counter.fetch_add(1, Ordering::Relaxed);
-                let comp = component.unwrap_or("-");
-                let msg = &message[..message.floor_char_boundary(120)];
-                eprintln!("  log     [{comp}] {msg}");
+                dry_run_log(level, component.unwrap_or("-"), message, data);
                 true
             }
             SinkInner::Discard => true,
@@ -394,9 +390,7 @@ impl Sink {
             }
             SinkInner::DryRun(dr) => {
                 dr.counter.fetch_add(1, Ordering::Relaxed);
-                let svc = service.unwrap_or("-");
-                let msg = &message[..message.floor_char_boundary(120)];
-                eprintln!("  log     [{svc}] {msg}");
+                dry_run_log(level, service.unwrap_or("-"), message, data);
                 true
             }
             SinkInner::Discard => true,
@@ -503,6 +497,24 @@ fn with_merged<'a, R>(
 }
 
 // --- Formatting ---
+
+/// Render one log line for dry-run output, showing the resolved severity,
+/// service/component tag, truncated message, and any structured payload. The
+/// payload is materialized here (dry-run only) via [`tell::IntoPayload`] so
+/// operators can confirm severity + structure before shipping for real.
+fn dry_run_log(level: LogLevel, tag: &str, message: &str, data: impl tell::IntoPayload) {
+    let lvl = format!("{level:?}");
+    let msg = &message[..message.floor_char_boundary(120)];
+    match data.into_payload() {
+        Some(bytes) if bytes != b"{}" => {
+            eprintln!(
+                "  log     {lvl:<9} [{tag}] {msg}  {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        _ => eprintln!("  log     {lvl:<9} [{tag}] {msg}"),
+    }
+}
 
 fn fmt_value(v: f64) -> String {
     if v.abs() >= 1_000_000_000.0 {

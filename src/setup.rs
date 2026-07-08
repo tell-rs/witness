@@ -5,7 +5,6 @@
 //! unreachable or does not support the config endpoint yet.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 const DEFAULT_SERVER: &str = "https://tell.rs";
 const DEFAULT_ENDPOINT: &str = "collect.tell.rs:50000";
@@ -128,34 +127,17 @@ fn validate_token(token: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// Fetch agent config from the Tell server using curl.
 ///
 /// The Authorization header goes to curl via `--config -` (stdin), not argv —
-/// argv is visible to every local user through `ps`.
+/// argv is visible to every local user through `ps`. Uses the shared
+/// [`witness::curl`] invocation so the token-off-argv idiom lives in one place.
 fn fetch_config(server: &str, token: &str) -> Result<String, Box<dyn std::error::Error>> {
-    use std::io::Write;
-
     let url = format!("{}/v1/agent/config", server.trim_end_matches('/'));
+    let ua = format!("User-Agent: witness/{}", env!("CARGO_PKG_VERSION"));
 
-    let mut child = Command::new("curl")
-        .args([
-            "-sSf",
-            "--max-time",
-            "10",
-            "-H",
-            &format!("User-Agent: witness/{}", env!("CARGO_PKG_VERSION")),
-            "--config",
-            "-",
-            &url,
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("curl not found: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        writeln!(stdin, "header = \"Authorization: Bearer {token}\"")?;
-    }
-
-    let output = child.wait_with_output()?;
+    let output = witness::curl::run_with_bearer(
+        &["-sSf", "--max-time", "10", "-H", &ua, "--config", "-", &url],
+        token,
+    )
+    .map_err(|e| format!("curl not found: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

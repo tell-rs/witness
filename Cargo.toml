@@ -1,6 +1,6 @@
 [package]
 name = "witness"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.93"
 description = "Lightweight host monitoring agent for the Tell platform"
@@ -29,11 +29,38 @@ serde_json = "1.0"
 toml = "0.8"
 glob = "0.3"
 libc = "0.2"
+# Linear-time (no catastrophic backtracking) regex for multiline log-record
+# start-pattern matching (`logs/multiline.rs`, spec 008). Zero further deps.
+regex-lite = "0.1"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Pure-Rust XML pull parser for the Windows Event Log parser
+# (`logs/eventlog_parse.rs`). All-platform: the parser and its fixture tests
+# build and run on the macOS dev box. XXE-safe (no DTD/external-entity
+# resolution) — see spec 004 R7.
+quick-xml = "0.41"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
+
+# Windows-only OS plumbing. Isolated here so Linux/macOS builds never pull it;
+# the pure parsing/fold/mapping logic lives in all-platform modules and is
+# tested on macOS. See specs 004/005/006.
+[target.'cfg(windows)'.dependencies]
+# Typed Win32 bindings: Event Log (Evt* API), threading (CreateEventW /
+# WaitForSingleObject), file identity (GetFileInformationByHandleEx /
+# FILE_ID_INFO), and token elevation query for the install flow.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_EventLog",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+] }
+# SCM service host + service manager (register/start/delete) for the Windows
+# Service install flow. See spec 005.
+windows-service = "0.8"
 
 [lints.clippy]
 # --- Prefer idiomatic Rust over manual implementations ---

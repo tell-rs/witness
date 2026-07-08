@@ -36,7 +36,16 @@ fn read_procfs_nonexistent_returns_error() {
 
 #[test]
 fn init_collectors_returns_platform_collectors() {
-    let config = SystemConfig::default();
+    // Enable collectors explicitly so this holds on macOS too, where they
+    // default OFF (spec 003). Linux already defaults ON.
+    let config = SystemConfig {
+        cpu: true,
+        memory: true,
+        load: true,
+        disk: true,
+        network: true,
+        ..SystemConfig::default()
+    };
     let collectors = init_collectors(&config);
     assert!(!collectors.is_empty());
 }

@@ -19,10 +19,13 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{info, warn};
 
+use super::multiline::{self, MultilineOpts};
+use super::structured::{FileParseOpts, classify_line};
 use crate::sink::Sink;
 
 /// How often to poll files for new content (ms). Backs off when idle.
@@ -48,7 +51,7 @@ const MAX_PARTIAL_BYTES: usize = 1024 * 1024;
 /// this many lines so the runtime can service other tasks. The primary
 /// backpressure mechanism is try_log() returning false (channel full), not
 /// this cap — it only prevents monopolising the executor under sustained load.
-const MAX_LINES_PER_POLL: usize = 32_000;
+pub(crate) const MAX_LINES_PER_POLL: usize = 32_000;
 /// When draining a large backlog (pos far behind file end), use faster 50ms
 /// polls instead of the default 250ms base.
 const POLL_CATCHUP_MS: u64 = 50;
@@ -61,7 +64,10 @@ fn state_file_path() -> std::path::PathBuf {
 
 // --- File identity ---
 
-/// Unique file identity based on device + inode (Unix) or path hash (non-Unix).
+/// Unique file identity: device + inode (Unix), volume serial + folded 128-bit
+/// file id via `FILE_ID_INFO` (Windows), or path hash (other non-Unix). The
+/// `{dev, ino}` shape and the `PATH\tPOS\tDEV\tINO` offset format are identical
+/// across platforms — Windows folds `FILE_ID_INFO` into it (spec 006 R4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FileId {
     pub(crate) dev: u64,
@@ -78,8 +84,12 @@ impl FileId {
         }
     }
 
+    /// Path-hash identity — cannot detect rotation (a renamed file keeps its
+    /// path-derived id, a replacement at the same path looks identical). Used
+    /// on non-Unix-non-Windows platforms and as the Windows degraded fallback
+    /// when the `GetFileInformationByHandleEx` syscall fails.
     #[cfg(not(unix))]
-    fn from_path(path: &Path) -> Self {
+    pub(crate) fn from_path(path: &Path) -> Self {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut h = DefaultHasher::new();
@@ -89,6 +99,141 @@ impl FileId {
             ino: h.finish(),
         }
     }
+
+    /// Real Windows file identity via `GetFileInformationByHandleEx(FileIdInfo)`
+    /// on an open handle, folded into `{dev, ino}` (spec 006 R4). Falls back to
+    /// the path hash (logged once) on syscall failure so tailing keeps working,
+    /// with degraded rotation detection, rather than dropping the file.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn from_file(file: &File, path: &Path) -> Self {
+        match windows_file_id(file) {
+            Some((volume_serial, id)) => fold_file_id(volume_serial, id),
+            None => {
+                warn_file_id_fallback_once(path);
+                Self::from_path(path)
+            }
+        }
+    }
+}
+
+/// Fold a `FILE_ID_INFO` (`VolumeSerialNumber` + 128-bit `FileId`) into the
+/// `{dev, ino}` pair the offset store uses (spec 006 R4). Pure; unit-tested on
+/// any platform.
+///
+/// `dev = volume_serial`. `ino =` the low 64 bits of the file id when its high
+/// 64 bits are zero (the NTFS common case — a 64-bit MFT reference
+/// zero-extended, lossless); otherwise a stable 64-bit hash of all 16 id bytes
+/// (ReFS, where the full 128 bits are significant). A hash collision is
+/// astronomically unlikely and documented.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[must_use]
+pub(crate) fn fold_file_id(volume_serial: u64, id: [u8; 16]) -> FileId {
+    let low = u64::from_le_bytes([id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]]);
+    let high = u64::from_le_bytes([id[8], id[9], id[10], id[11], id[12], id[13], id[14], id[15]]);
+    let ino = if high == 0 {
+        low
+    } else {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        id.hash(&mut h);
+        h.finish()
+    };
+    FileId {
+        dev: volume_serial,
+        ino,
+    }
+}
+
+/// Byte-order-mark classification of a file's leading bytes (spec 006 R6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bom {
+    /// UTF-16 little-endian (`FF FE`).
+    Utf16Le,
+    /// UTF-16 big-endian (`FE FF`).
+    Utf16Be,
+    /// UTF-8 (`EF BB BF`).
+    Utf8,
+    /// No recognized BOM.
+    None,
+}
+
+impl Bom {
+    /// Whether this BOM marks a UTF-16 file that the byte-oriented tailer must
+    /// skip (v1 supports UTF-8/lossy only — spec 006 R6).
+    #[must_use]
+    pub(crate) fn is_utf16(self) -> bool {
+        matches!(self, Bom::Utf16Le | Bom::Utf16Be)
+    }
+}
+
+/// Classify a file's leading bytes. Pure; unit-tested with byte-slice fixtures.
+/// The UTF-8 BOM (`EF BB BF`) must never be mistaken for UTF-16.
+#[must_use]
+pub(crate) fn detect_bom(bytes: &[u8]) -> Bom {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        Bom::Utf16Le
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        Bom::Utf16Be
+    } else if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Bom::Utf8
+    } else {
+        Bom::None
+    }
+}
+
+/// Whether the file at `path` begins with a UTF-16 BOM (and must be skipped).
+/// Reads only the leading bytes; a read error is treated as "not UTF-16" (the
+/// normal open/read path handles a truly unreadable file).
+fn file_is_utf16(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 3];
+    let n = f.read(&mut buf).unwrap_or(0);
+    detect_bom(&buf[..n]).is_utf16()
+}
+
+/// Query `FILE_ID_INFO` for an open handle: `(VolumeSerialNumber, FileId bytes)`.
+#[cfg(target_os = "windows")]
+fn windows_file_id(file: &File) -> Option<(u64, [u8; 16])> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let handle = HANDLE(file.as_raw_handle());
+    let mut info = FILE_ID_INFO::default();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok.is_ok() {
+        Some((info.VolumeSerialNumber, info.FileId.Identifier))
+    } else {
+        None
+    }
+}
+
+/// Warn (once per process) that the Windows file-id syscall failed and the
+/// tailer fell back to the path hash for a file.
+#[cfg(target_os = "windows")]
+fn warn_file_id_fallback_once(path: &Path) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        warn!(
+            path = %path.display(),
+            "tail: GetFileInformationByHandleEx failed — falling back to path-hash \
+             identity (degraded rotation detection)"
+        );
+    });
 }
 
 // --- Per-file state ---
@@ -106,17 +251,30 @@ pub(crate) struct TailedFile {
     pub(crate) open_failures: u32,
     /// Retained file descriptor for draining after rotation.
     pub(crate) retained_fd: Option<File>,
+    /// UTF-16 file: registered as a marker so the rescan neither re-registers
+    /// nor re-warns, but never read (v1 ships UTF-8/lossy only — spec 006 R6).
+    pub(crate) skip_utf16: bool,
+    /// In-flight multiline record aggregation state (spec 008). `None` in the
+    /// single-line default; lazily created by the multiline path on first read.
+    /// Never persisted — a crash re-derives the in-flight record from `pos`.
+    pub(crate) agg: Option<multiline::Aggregator>,
 }
 
 // --- Main loop ---
 
 /// Tail log files. Blocks until cancellation.
+///
+/// `ml` carries the compiled multiline aggregation settings (spec 008) when
+/// `multiline_start_pattern` is configured; `None` runs the single-line-per-entry
+/// path unchanged. The `Arc` is compiled once at startup and shared read-only.
 pub async fn tail_files(
     patterns: &[String],
     sink: Sink,
     mut cancel: tokio::sync::watch::Receiver<bool>,
-    parse_syslog: bool,
+    opts: FileParseOpts,
+    ml: Option<Arc<MultilineOpts>>,
 ) {
+    let ml = ml.as_deref();
     let saved = load_offsets();
     let mut files: HashMap<FileId, TailedFile> = HashMap::new();
     // Map from path → FileId for quick lookup during glob scan.
@@ -132,6 +290,9 @@ pub async fn tail_files(
     }
 
     let mut poll_interval_ms = POLL_BASE_MS;
+    // Remaining time to the nearest pending multiline record's inactivity flush
+    // (spec 008 R4). Caps the poll sleep so an idle record still ships on time.
+    let mut pending_flush: Option<Duration> = None;
     let mut last_save = Instant::now();
     let mut glob_interval = tokio::time::interval(std::time::Duration::from_secs(GLOB_RESCAN_SECS));
     let mut save_interval = tokio::time::interval(std::time::Duration::from_secs(OFFSET_SAVE_SECS));
@@ -139,10 +300,12 @@ pub async fn tail_files(
     save_interval.tick().await;
 
     loop {
+        let sleep = poll_delay(poll_interval_ms, pending_flush);
         tokio::select! {
             // Poll all files
-            _ = tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)) => {
-                let total_bytes = poll_all(&mut files, &mut path_index, &sink, parse_syslog);
+            _ = tokio::time::sleep(sleep) => {
+                let total_bytes = poll_all(&mut files, &mut path_index, &sink, opts, ml);
+                pending_flush = flush_expired_records(&mut files, &sink, opts, ml);
 
                 // Fast catchup when data is flowing, backoff when idle
                 if total_bytes > 0 {
@@ -195,15 +358,53 @@ pub async fn tail_files(
             // Shutdown
             _ = cancel.changed() => {
                 // Final drain — read all remaining lines including retained fds
-                poll_all(&mut files, &mut path_index, &sink, parse_syslog);
+                poll_all(&mut files, &mut path_index, &sink, opts, ml);
                 for f in files.values_mut() {
-                    flush_partial(f, &sink);
+                    match ml {
+                        // Ship any in-flight multiline record before exit (R7).
+                        Some(ml) => multiline::flush_final(f, &sink, opts, ml),
+                        None => flush_partial(f, &sink),
+                    }
                 }
                 save_offsets(&files);
                 return;
             }
         }
     }
+}
+
+/// The next poll sleep: the adaptive interval, capped by the nearest pending
+/// multiline inactivity flush (spec 008 R4) so a buffered record is not held
+/// past its timeout while the loop backs off. Floored at [`POLL_CATCHUP_MS`] to
+/// avoid a busy-loop when a record is already due but could not ship (R3).
+fn poll_delay(poll_interval_ms: u64, pending_flush: Option<Duration>) -> Duration {
+    let base = Duration::from_millis(poll_interval_ms);
+    match pending_flush {
+        Some(remaining) => base
+            .min(remaining)
+            .max(Duration::from_millis(POLL_CATCHUP_MS)),
+        None => base,
+    }
+}
+
+/// Flush every file whose in-flight multiline record has passed its inactivity
+/// timeout, returning the smallest remaining time to any still-pending record's
+/// timeout (for the poll-delay cap). `None` when aggregation is off or no record
+/// is pending.
+fn flush_expired_records(
+    files: &mut HashMap<FileId, TailedFile>,
+    sink: &Sink,
+    opts: FileParseOpts,
+    ml: Option<&MultilineOpts>,
+) -> Option<Duration> {
+    let ml = ml?;
+    let mut nearest: Option<Duration> = None;
+    for f in files.values_mut() {
+        if let Some(remaining) = multiline::flush_if_expired(f, sink, opts, ml) {
+            nearest = Some(nearest.map_or(remaining, |n| n.min(remaining)));
+        }
+    }
+    nearest
 }
 
 // --- File registration ---
@@ -222,14 +423,22 @@ pub(crate) fn register_file(
         return;
     };
 
-    #[cfg(unix)]
-    let id = FileId::from_metadata(&metadata);
-    #[cfg(not(unix))]
-    let id = FileId::from_path(path);
+    let id = file_id_of(path, &metadata);
 
     // Already tracking this inode
     if files.contains_key(&id) {
         return;
+    }
+
+    // UTF-16 detection (spec 006 R6): the byte-oriented tailer would emit
+    // mojibake. Register a skip marker (deduped by id) so we neither ship
+    // garbage nor re-warn on every rescan; UTF-8 (incl. a UTF-8 BOM) is fine.
+    let skip_utf16 = file_is_utf16(path);
+    if skip_utf16 {
+        warn!(
+            path = %path.display(),
+            "tail: UTF-16 file skipped (only UTF-8/lossy supported in v1)"
+        );
     }
 
     let has_checkpoint = saved
@@ -265,8 +474,34 @@ pub(crate) fn register_file(
             partial: String::new(),
             open_failures: 0,
             retained_fd: None,
+            skip_utf16,
+            agg: None,
         },
     );
+}
+
+/// Compute the file identity for a path, given its metadata. On Windows this
+/// opens the file to query `FILE_ID_INFO`; on Unix it uses the metadata; other
+/// platforms fall back to the path hash.
+fn file_id_of(path: &Path, metadata: &std::fs::Metadata) -> FileId {
+    #[cfg(unix)]
+    {
+        let _ = path;
+        FileId::from_metadata(metadata)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = metadata;
+        match File::open(path) {
+            Ok(f) => FileId::from_file(&f, path),
+            Err(_) => FileId::from_path(path),
+        }
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = metadata;
+        FileId::from_path(path)
+    }
 }
 
 // --- Polling ---
@@ -276,7 +511,8 @@ fn poll_all(
     files: &mut HashMap<FileId, TailedFile>,
     path_index: &mut HashMap<PathBuf, FileId>,
     sink: &Sink,
-    parse_syslog: bool,
+    opts: FileParseOpts,
+    ml: Option<&MultilineOpts>,
 ) -> u64 {
     let mut total_bytes = 0u64;
 
@@ -287,11 +523,21 @@ fn poll_all(
             continue;
         };
 
+        // UTF-16 marker: never read (would ship mojibake) — spec 006 R6.
+        if tailed.skip_utf16 {
+            continue;
+        }
+
         // Entries with a retained fd are rotated-out files: their only job is
         // draining to EOF. The path is owned by the new-inode entry registered
         // at rotation time, so once drained, remove the entry.
         if tailed.retained_fd.is_some() {
-            total_bytes += drain_retained(tailed, sink, parse_syslog);
+            // Multiline mode continues the in-flight record into the drain and
+            // ships it at EOF (spec 008 R7); single-line mode drains lines.
+            total_bytes += match ml {
+                Some(ml) => multiline::drain(tailed, sink, opts, ml),
+                None => drain_retained(tailed, sink, opts),
+            };
             if tailed.retained_fd.is_none()
                 && let Some(f) = files.remove(&id)
                 && path_index.get(&f.path) == Some(&f.id)
@@ -301,7 +547,7 @@ fn poll_all(
             continue;
         }
 
-        match check_and_read(tailed, sink, parse_syslog) {
+        match check_and_read(tailed, sink, opts, ml) {
             ReadResult::Bytes(n) => {
                 tailed.open_failures = 0;
                 total_bytes += n;
@@ -352,7 +598,12 @@ enum ReadResult {
     Idle,
 }
 
-fn check_and_read(tailed: &mut TailedFile, sink: &Sink, parse_syslog: bool) -> ReadResult {
+fn check_and_read(
+    tailed: &mut TailedFile,
+    sink: &Sink,
+    opts: FileParseOpts,
+    ml: Option<&MultilineOpts>,
+) -> ReadResult {
     let Ok(file) = File::open(&tailed.path) else {
         return ReadResult::OpenFailed;
     };
@@ -363,7 +614,9 @@ fn check_and_read(tailed: &mut TailedFile, sink: &Sink, parse_syslog: bool) -> R
 
     #[cfg(unix)]
     let current_id = FileId::from_metadata(&metadata);
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    let current_id = FileId::from_file(&file, &tailed.path);
+    #[cfg(not(any(unix, target_os = "windows")))]
     let current_id = FileId::from_path(&tailed.path);
 
     // Rotation detected — the path now points to a different inode, so the
@@ -372,7 +625,13 @@ fn check_and_read(tailed: &mut TailedFile, sink: &Sink, parse_syslog: bool) -> R
     // (common suffixes like `.1`, then a directory scan) and hand its fd to
     // the caller for draining. The caller registers the new file separately.
     if current_id != tailed.id {
-        flush_partial(tailed, sink);
+        // Multiline: leave the in-flight record and sub-line partial intact —
+        // the retained-fd drain continues them from `read_ahead` and ships the
+        // record at the old file's EOF (spec 008 R7). Single-line: flush the
+        // sub-line partial now, as before.
+        if ml.is_none() {
+            flush_partial(tailed, sink);
+        }
 
         if let Some(old_fd) = find_rotated_file(tailed) {
             return ReadResult::Rotated { old_fd };
@@ -385,15 +644,23 @@ fn check_and_read(tailed: &mut TailedFile, sink: &Sink, parse_syslog: bool) -> R
 
     // Detect truncation (copytruncate rotation)
     if current_len < tailed.pos {
-        flush_partial(tailed, sink);
         tailed.pos = 0;
+        match ml {
+            // The buffered bytes are gone from the file — discard the in-flight
+            // record and reset the read cursor to 0 (spec 008 R6).
+            Some(_) => multiline::reset(tailed),
+            None => flush_partial(tailed, sink),
+        }
     }
 
     if current_len <= tailed.pos {
         return ReadResult::Idle;
     }
 
-    let bytes_read = read_lines(file, tailed, sink, parse_syslog);
+    let bytes_read = match ml {
+        Some(ml) => multiline::read_live(file, tailed, sink, opts, ml),
+        None => read_lines(file, tailed, sink, opts),
+    };
     if bytes_read > 0 {
         ReadResult::Bytes(bytes_read)
     } else {
@@ -457,7 +724,7 @@ pub(crate) fn find_rotated_file(tailed: &TailedFile) -> Option<File> {
 /// when the SDK channel is full or the cap is hit, the fd is put back and
 /// draining resumes from `pos` on the next poll. On EOF the fd is dropped
 /// and the caller removes the entry.
-pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, parse_syslog: bool) -> u64 {
+pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, opts: FileParseOpts) -> u64 {
     let Some(file) = tailed.retained_fd.take() else {
         return 0;
     };
@@ -477,12 +744,7 @@ pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, parse_syslog:
             Ok(0) => break, // EOF — old file fully drained
             Ok(n) => {
                 if buf.last() == Some(&b'\n') {
-                    if !try_emit_line(
-                        &buf[..buf.len() - 1],
-                        &mut tailed.partial,
-                        sink,
-                        parse_syslog,
-                    ) {
+                    if !try_emit_line(&buf[..buf.len() - 1], &mut tailed.partial, sink, opts) {
                         // Channel full — keep the fd, resume next poll.
                         tailed.retained_fd = Some(reader.into_inner());
                         return bytes_read;
@@ -512,7 +774,7 @@ pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, parse_syslog:
 
 /// Append bytes to the partial-line buffer, capped at [`MAX_PARTIAL_BYTES`]
 /// on a UTF-8 character boundary (a plain `truncate` can panic mid-char).
-fn push_partial(partial: &mut String, bytes: &[u8]) {
+pub(crate) fn push_partial(partial: &mut String, bytes: &[u8]) {
     if partial.len() >= MAX_PARTIAL_BYTES {
         return;
     }
@@ -532,7 +794,7 @@ pub(crate) fn read_lines(
     file: File,
     tailed: &mut TailedFile,
     sink: &Sink,
-    parse_syslog: bool,
+    opts: FileParseOpts,
 ) -> u64 {
     let mut reader = BufReader::new(file);
     if reader.seek(SeekFrom::Start(tailed.pos)).is_err() {
@@ -549,12 +811,7 @@ pub(crate) fn read_lines(
             Ok(0) => break,
             Ok(n) => {
                 if buf.last() == Some(&b'\n') {
-                    if !try_emit_line(
-                        &buf[..buf.len() - 1],
-                        &mut tailed.partial,
-                        sink,
-                        parse_syslog,
-                    ) {
+                    if !try_emit_line(&buf[..buf.len() - 1], &mut tailed.partial, sink, opts) {
                         // Channel full — don't advance offset, retry next poll.
                         break;
                     }
@@ -588,7 +845,7 @@ pub(crate) fn try_emit_line(
     line_bytes: &[u8],
     partial: &mut String,
     sink: &Sink,
-    parse_syslog: bool,
+    opts: FileParseOpts,
 ) -> bool {
     let line_lossy = String::from_utf8_lossy(line_bytes);
 
@@ -601,27 +858,27 @@ pub(crate) fn try_emit_line(
         std::borrow::Cow::Owned(assembled)
     };
 
+    // Strip a leading UTF-8 BOM (U+FEFF) — it survives `from_utf8_lossy` on the
+    // first line of a UTF-8-with-BOM file and must not leak into the body
+    // (spec 006 R6). CRLF is handled by `trim_end` (strips the trailing `\r`).
     let trimmed = complete.trim_end();
+    let trimmed = trimmed.strip_prefix('\u{feff}').unwrap_or(trimmed);
     if trimmed.is_empty() {
         partial.clear();
         return true;
     }
 
-    let ok = if parse_syslog {
-        if let Some(parsed) = super::syslog::parse(trimmed) {
-            sink.try_log_with_service(
-                tell::LogLevel::Info,
-                parsed.body,
-                None,
-                Some(parsed.program),
-                None::<()>,
-            )
-        } else {
-            sink.try_log(tell::LogLevel::Info, trimmed, None, None::<()>)
-        }
-    } else {
-        sink.try_log(tell::LogLevel::Info, trimmed, None, None::<()>)
-    };
+    // Syslog envelope → structured extraction → severity, all in the shared
+    // `structured` module (the journald quality bar). The syslog envelope is
+    // parsed FIRST, then structure is extracted from the inner body.
+    let classified = classify_line(trimmed, opts);
+    let ok = sink.try_log_with_service(
+        classified.level,
+        &classified.body,
+        None,
+        classified.service,
+        classified.payload,
+    );
 
     if ok {
         partial.clear();

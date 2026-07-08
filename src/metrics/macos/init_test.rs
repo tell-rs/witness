@@ -2,7 +2,15 @@ use crate::config::SystemConfig;
 
 #[test]
 fn init_all_collectors() {
-    let config = SystemConfig::default();
+    // macOS collectors default OFF (spec 003) — enable them explicitly here.
+    let config = SystemConfig {
+        cpu: true,
+        memory: true,
+        load: true,
+        disk: true,
+        network: true,
+        ..SystemConfig::default()
+    };
     let collectors = super::init_collectors(&config);
     let names: Vec<&str> = collectors.iter().map(|c| c.name()).collect();
     assert!(names.contains(&"load"));

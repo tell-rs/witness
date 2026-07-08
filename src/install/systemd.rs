@@ -1,20 +1,16 @@
-//! `witness install` — full post-install setup.
+//! Linux `witness install` — systemd flow.
 //!
-//! Mirrors what the curl installer (`curl -sSfL https://tell.rs/agent | bash`)
-//! does after downloading the binary: installs to /usr/local/bin, creates a
-//! system user, writes the systemd unit, configures, and starts the agent.
-//!
-//! Token is optional — without it, system setup is performed and instructions
-//! for manual configuration are printed.
+//! Mirrors what the curl installer does after downloading the binary: installs
+//! to /usr/local/bin, creates a system user, writes the systemd unit,
+//! configures, and starts the agent.
 
 use std::path::PathBuf;
 use std::process::Command;
 
+use super::{INSTALL_DIR, InstallArgs, setup_args};
 use crate::setup;
 
-const INSTALL_DIR: &str = "/usr/local/bin";
 const CONFIG_DIR: &str = "/etc/witness";
-const CONFIG_FILE: &str = "/etc/witness/config.toml";
 const SERVICE_FILE: &str = "/etc/systemd/system/witness.service";
 
 const SYSTEMD_UNIT: &str = "\
@@ -65,47 +61,8 @@ RestrictRealtime=yes
 WantedBy=multi-user.target
 ";
 
-#[derive(clap::Args)]
-pub struct InstallArgs {
-    /// API key or install token (optional — skips config if omitted)
-    #[arg(long)]
-    pub token: Option<String>,
-
-    /// Tell server URL (HTTP/HTTPS) for fetching config
-    #[arg(long, default_value = "https://tell.rs")]
-    pub server: String,
-
-    /// TCP data endpoint override (host:port)
-    #[arg(long)]
-    pub endpoint: Option<String>,
-
-    /// Skip auto-config fetch, generate config locally
-    #[arg(long)]
-    pub offline: bool,
-
-    /// Overwrite existing config and service files
-    #[arg(long)]
-    pub force: bool,
-}
-
-pub fn run(args: InstallArgs) {
-    if let Err(e) = execute(args) {
-        eprintln!("\x1b[31m✗\x1b[0m {e}");
-        std::process::exit(1);
-    }
-}
-
-fn execute(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // The install flow is systemd + useradd — Linux only.
-    if !cfg!(target_os = "linux") {
-        return Err(
-            "witness install requires Linux with systemd. On other platforms, \
-             run `witness setup` to write a config and start the binary directly."
-                .into(),
-        );
-    }
-
-    // Must be root for user creation and systemd
+pub fn install(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Must be root for user creation and systemd.
     #[cfg(unix)]
     if unsafe { libc::geteuid() } != 0 {
         return Err("witness install must be run as root (use sudo)".into());
@@ -114,26 +71,12 @@ fn execute(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
     let version = env!("CARGO_PKG_VERSION");
     eprintln!("\nInstalling witness v{version}...\n");
 
-    // 1. Install binary to /usr/local/bin
     install_binary()?;
-
-    // 2. Create system user
     create_user()?;
-
-    // 3. Write systemd service
     install_service(args.force)?;
 
-    // 4. Configure and start (if token provided)
-    if let Some(token) = args.token {
-        let setup_args = setup::SetupArgs {
-            token,
-            server: args.server,
-            endpoint: args.endpoint,
-            offline: args.offline,
-            config: PathBuf::from(CONFIG_FILE),
-            force: args.force,
-        };
-        setup::execute_checked(&setup_args)?;
+    if let Some(token) = args.token.clone() {
+        setup::execute_checked(&setup_args(&args, token))?;
         ok("configured");
 
         run_cmd("systemctl", &["enable", "--now", "witness"])?;
@@ -152,13 +95,10 @@ fn execute(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// --- Steps ------------------------------------------------------------------
-
 fn install_binary() -> Result<(), Box<dyn std::error::Error>> {
     let current = std::env::current_exe()?.canonicalize()?;
     let target = PathBuf::from(INSTALL_DIR).join("witness");
 
-    // Already in the right place (e.g. re-running after curl install)
     if target.exists() && target.canonicalize().ok().as_ref() == Some(&current) {
         return Ok(());
     }
@@ -177,7 +117,6 @@ fn install_binary() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn create_user() -> Result<(), Box<dyn std::error::Error>> {
-    // Check if user already exists
     if Command::new("id")
         .args(["-u", "witness"])
         .output()?
@@ -199,15 +138,13 @@ fn create_user() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     ok("created witness user");
 
-    // Add to adm group for log file access (best-effort)
     if Command::new("getent")
         .args(["group", "adm"])
         .output()
         .is_ok_and(|o| o.status.success())
+        && run_cmd("usermod", &["-aG", "adm", "witness"]).is_ok()
     {
-        if run_cmd("usermod", &["-aG", "adm", "witness"]).is_ok() {
-            ok("added witness to adm group");
-        }
+        ok("added witness to adm group");
     }
 
     Ok(())
@@ -220,17 +157,13 @@ fn install_service(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Ensure config directory exists
     std::fs::create_dir_all(CONFIG_DIR)?;
-
     std::fs::write(&path, SYSTEMD_UNIT)?;
     run_cmd("systemctl", &["daemon-reload"])?;
     ok("installed systemd service");
 
     Ok(())
 }
-
-// --- Helpers ----------------------------------------------------------------
 
 fn ok(msg: &str) {
     eprintln!("\x1b[32m✓\x1b[0m {msg}");

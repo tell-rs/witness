@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.5.0
+
+New:
+- logs: Windows Event Log source — System, Application, and Security channels stream to Tell, with per-event structured fields (provider, event ID, keywords, task, opcode, correlation and execution IDs, user SID) and a readable message even when a provider's manifest is missing
+- logs: Windows audit events map to real severities — a failed logon is an error, not info — following the keyword-based outcome model, with the outcome recorded on the entry
+- logs: Windows Event Log filtering — include/exclude event IDs with ranges ("4624,4625,4700-4800,-4735"), exclude noisy providers, or supply a raw XPath query; a starter list of chatty event IDs ships commented in the example config
+- logs: file-tailed lines now get the same treatment as journald — JSON and logfmt lines are split into a clean message plus structured fields, and severity is detected from a level field or the line text (nginx, log4j, env_logger, structured JSON) instead of everything defaulting to info
+- logs: multiline aggregation for file tailing — stack traces and multi-line records join into one entry via a start-of-record pattern, shipped whole (never split mid-record, never lost under backpressure)
+- logs: journald service include/exclude filtering, matching the filtering story on the other platforms
+- config: remote configuration — set a server URL and the agent polls for centrally managed config, validates it, and applies it through the existing reload path without a restart; HTTPS-only, warns on credential or endpoint changes, and keeps the last good config if the server is unreachable
+- install: witness install, uninstall, and status on Windows register and manage a Windows service
+
+Changed:
+- Windows and macOS default to log forwarding with metrics off; enable collectors under [system]. Linux is unchanged (metrics and logs on)
+
+Note:
+- Windows support is implemented and cross-compiles cleanly, but the OS-level Event Log and service plumbing has not yet been exercised on a Windows host — treat it as experimental until a Windows smoke test lands
+
+## v0.4.0
+
+New:
+- logs: macOS unified log source — errors, faults, and security events (privacy prompts, Gatekeeper, sudo, sshd, logins) stream to Tell, with a single predicate setting for enterprise policies
+- logs: lossless resume on macOS — restarts replay the durable log store from the last checkpoint, so crashes and backpressure never lose persisted entries
+- logs: macOS file-tailing defaults now cover install.log and Homebrew service logs (nginx, postgres) for Mac servers
+- config: metrics collectors default off on macOS — witness is a log forwarder first there; enable collectors under [system]. Linux defaults unchanged
+- install: witness install on macOS sets up a hardened launchd daemon with logs under /Library/Logs/witness
+- install: witness uninstall and witness status subcommands on macOS
+
 ## v0.3.0
 
 New:

@@ -17,6 +17,11 @@ use tracing::{info, warn};
 
 use crate::sink::Sink;
 
+// Structured MESSAGE parsing lives in the shared `structured` module so the
+// file tailer reuses byte-identical logic. Re-exported here so this remains the
+// journald source's public API surface.
+pub use super::structured::split_message;
+
 /// Maximum JSON line length before we skip processing.
 /// Note: `read_line` buffers the full line before returning — this guard
 /// prevents wasting CPU on JSON parsing, not the memory allocation itself.
@@ -35,6 +40,29 @@ const FULL_CHANNEL_RETRY: Duration = Duration::from_millis(100);
 
 /// Our own syslog identifier — filtered to prevent feedback loops.
 const SELF_IDENTIFIER: &str = "witness";
+
+/// Service-name include/exclude filter for the journald source (spec: journald
+/// parity with the Windows Event Log `eventlog_exclude_providers` and the macOS
+/// `unified_log_predicate`). Matches the resolved program name
+/// (`SYSLOG_IDENTIFIER` / `_COMM`), case-sensitive exact.
+#[derive(Clone, Default)]
+pub struct ServiceFilter {
+    /// Allow-list. Empty means allow all.
+    pub include: Vec<String>,
+    /// Deny-list. An exclude match wins over an include.
+    pub exclude: Vec<String>,
+}
+
+impl ServiceFilter {
+    /// Whether an entry from `program` must be dropped (not shipped).
+    #[must_use]
+    fn excludes(&self, program: &str) -> bool {
+        if self.exclude.iter().any(|s| s == program) {
+            return true;
+        }
+        !self.include.is_empty() && !self.include.iter().any(|s| s == program)
+    }
+}
 
 // ─── Types ─────────────��────────────────────────────────────────────
 
@@ -102,11 +130,12 @@ impl ReaderState {
     async fn handle_entry(
         &mut self,
         line: &str,
+        filter: &ServiceFilter,
         sink: &Sink,
         cancel: &mut watch::Receiver<bool>,
     ) -> bool {
         loop {
-            match process_entry(line, sink) {
+            match process_entry(line, filter, sink) {
                 ProcessResult::Handled(cursor) => {
                     if let Some(c) = cursor {
                         self.last_cursor = Some(c);
@@ -149,11 +178,11 @@ impl ReaderState {
 /// Spawns `journalctl --output=json --follow`, reads structured entries,
 /// and ships each via the sink. Restarts with exponential backoff if the
 /// subprocess exits unexpectedly.
-pub async fn tail_journal(sink: Sink, mut cancel: watch::Receiver<bool>) {
+pub async fn tail_journal(sink: Sink, mut cancel: watch::Receiver<bool>, filter: ServiceFilter) {
     let mut backoff = Duration::from_secs(1);
 
     loop {
-        match run_journalctl(&sink, &mut cancel).await {
+        match run_journalctl(&sink, &mut cancel, &filter).await {
             LoopExit::Cancelled => break,
             LoopExit::Failed(reason) => {
                 if *cancel.borrow() {
@@ -164,7 +193,7 @@ pub async fn tail_journal(sink: Sink, mut cancel: watch::Receiver<bool>) {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = cancel.changed() => break,
                 }
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                backoff = super::source::next_backoff(backoff, MAX_BACKOFF);
             }
         }
     }
@@ -185,7 +214,11 @@ pub fn is_available() -> bool {
 
 /// Single run of the journalctl subprocess. Returns when the process exits
 /// or cancellation is received.
-async fn run_journalctl(sink: &Sink, cancel: &mut watch::Receiver<bool>) -> LoopExit {
+async fn run_journalctl(
+    sink: &Sink,
+    cancel: &mut watch::Receiver<bool>,
+    filter: &ServiceFilter,
+) -> LoopExit {
     let cursor = load_cursor();
     info!(
         cursor = cursor.as_deref().unwrap_or("(none)"),
@@ -221,7 +254,7 @@ async fn run_journalctl(sink: &Sink, cancel: &mut watch::Receiver<bool>) -> Loop
                     }
                     Ok(n) if n > MAX_LINE_LEN => continue,
                     Ok(_) => {
-                        if !state.handle_entry(&line_buf, sink, cancel).await {
+                        if !state.handle_entry(&line_buf, filter, sink, cancel).await {
                             // Cancelled while waiting out backpressure.
                             let _ = child.kill().await;
                             break;
@@ -265,7 +298,7 @@ fn spawn_journalctl(cursor: Option<&str>) -> Result<tokio::process::Child, std::
 /// Filtered/empty entries count as handled and still advance the cursor.
 /// When the SDK channel is full the entry is not shipped and the caller
 /// must retry the same line without advancing the cursor.
-pub(crate) fn process_entry(json_line: &str, sink: &Sink) -> ProcessResult {
+pub(crate) fn process_entry(json_line: &str, filter: &ServiceFilter, sink: &Sink) -> ProcessResult {
     let Ok(entry) = serde_json::from_str::<JournalEntry>(json_line.trim()) else {
         return ProcessResult::ParseFailed;
     };
@@ -291,6 +324,12 @@ pub(crate) fn process_entry(json_line: &str, sink: &Sink) -> ProcessResult {
         return ProcessResult::Handled(cursor);
     }
 
+    // Operator service include/exclude (filtered entries still advance the
+    // cursor so no reprocessing on restart).
+    if filter.excludes(program) {
+        return ProcessResult::Handled(cursor);
+    }
+
     let level = entry
         .priority
         .as_deref()
@@ -312,161 +351,6 @@ pub(crate) fn process_entry(json_line: &str, sink: &Sink) -> ProcessResult {
     }
 
     ProcessResult::Handled(cursor)
-}
-
-/// Extract the event phrase (body) and structured fields from MESSAGE.
-///
-/// Detects JSON if the text starts with `{`; otherwise tries logfmt. On
-/// any parse failure, returns the full MESSAGE as body with no fields —
-/// witness stays a forwarder, never drops data.
-///
-/// Body is borrowed when possible (logfmt slice) and owned when not
-/// (JSON value extracted from a parsed object).
-pub fn split_message(message: &str) -> (std::borrow::Cow<'_, str>, Option<serde_json::Value>) {
-    use std::borrow::Cow;
-
-    let trimmed = message.trim_start();
-    if trimmed.starts_with('{') {
-        if let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str(trimmed) {
-            let body = obj
-                .remove("msg")
-                .or_else(|| obj.remove("message"))
-                .map(|v| match v {
-                    serde_json::Value::String(s) => s,
-                    other => other.to_string(),
-                })
-                .map_or(Cow::Borrowed(message), Cow::Owned);
-            let fields = if obj.is_empty() {
-                None
-            } else {
-                Some(serde_json::Value::Object(obj))
-            };
-            return (body, fields);
-        }
-    }
-
-    if let Some(split_at) = logfmt_field_start(message) {
-        let body = &message[..split_at];
-        let rest = &message[split_at + 1..];
-        let fields = parse_logfmt_fields(rest);
-        let fields_v = if fields.is_empty() {
-            None
-        } else {
-            let obj: serde_json::Map<String, serde_json::Value> = fields
-                .into_iter()
-                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                .collect();
-            Some(serde_json::Value::Object(obj))
-        };
-        return (Cow::Borrowed(body), fields_v);
-    }
-
-    (Cow::Borrowed(message), None)
-}
-
-/// Scan for the byte offset of the space preceding the first `key=value`
-/// token. Returns `None` if no logfmt-shaped tail is present.
-fn logfmt_field_start(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b' ' {
-            // Look ahead for `<ident>=` at bytes[i+1..]
-            let start = i + 1;
-            let mut j = start;
-            while j < bytes.len() && is_logfmt_key_byte(bytes[j]) {
-                j += 1;
-            }
-            if j > start && j < bytes.len() && bytes[j] == b'=' {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn is_logfmt_key_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'
-}
-
-/// Parse a logfmt tail (the part after the event phrase) into key/value pairs.
-fn parse_logfmt_fields(s: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Skip whitespace.
-        while i < bytes.len() && bytes[i] == b' ' {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        // Read key.
-        let key_start = i;
-        while i < bytes.len() && is_logfmt_key_byte(bytes[i]) {
-            i += 1;
-        }
-        if i == key_start || i >= bytes.len() || bytes[i] != b'=' {
-            // Malformed — skip to next space.
-            while i < bytes.len() && bytes[i] != b' ' {
-                i += 1;
-            }
-            continue;
-        }
-        let key = s[key_start..i].to_string();
-        i += 1; // past '='
-        // Read value: quoted or bare. Copy via `&str` slices between escape
-        // points — never byte-by-byte casts, which would mangle multi-byte
-        // UTF-8 characters. Slice bounds always land on `"` or `\`, which in
-        // valid UTF-8 can only be standalone ASCII bytes.
-        let value = if i < bytes.len() && bytes[i] == b'"' {
-            i += 1;
-            let mut v = String::new();
-            let mut run_start = i;
-            while i < bytes.len() && bytes[i] != b'"' {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    match bytes[i + 1] {
-                        b'"' => {
-                            v.push_str(&s[run_start..i]);
-                            v.push('"');
-                            i += 2;
-                            run_start = i;
-                        }
-                        b'\\' => {
-                            v.push_str(&s[run_start..i]);
-                            v.push('\\');
-                            i += 2;
-                            run_start = i;
-                        }
-                        b'n' => {
-                            v.push_str(&s[run_start..i]);
-                            v.push('\n');
-                            i += 2;
-                            run_start = i;
-                        }
-                        // Unknown escape — keep the backslash and whatever
-                        // follows literally (it may be multi-byte).
-                        _ => i += 1,
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            v.push_str(&s[run_start..i.min(bytes.len())]);
-            i += 1; // past closing '"'
-            v
-        } else {
-            let v_start = i;
-            while i < bytes.len() && bytes[i] != b' ' {
-                i += 1;
-            }
-            s[v_start..i].to_string()
-        };
-        out.push((key, value));
-    }
-    out
 }
 
 /// Combine journald metadata fields with fields parsed from MESSAGE.
@@ -553,14 +437,6 @@ fn load_cursor() -> Option<String> {
 }
 
 fn save_cursor(cursor: Option<&str>) {
-    use std::io::Write;
     let Some(c) = cursor else { return };
-    let path = cursor_path();
-    let tmp = path.with_extension("tmp");
-    let Ok(mut file) = std::fs::File::create(&tmp) else {
-        return;
-    };
-    if file.write_all(c.as_bytes()).is_ok() && file.sync_all().is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    super::source::write_checkpoint(&cursor_path(), c.as_bytes());
 }

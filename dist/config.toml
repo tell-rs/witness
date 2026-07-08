@@ -8,8 +8,20 @@ api_key = "feed1e11feed1e11feed1e11feed1e11"
 # Collector endpoint (default: localhost:50000)
 # endpoint = "localhost:50000"
 
-# Tell server URL for auto-config. Omit to disable.
+# Remote config polling (spec 007). Tell control-plane URL. When set, the agent
+# periodically GETs {server}/v1/agent/config and applies a changed, valid config
+# by atomically rewriting THIS file and reloading (zero data loss). Omit to
+# disable. MUST be https:// — the poller repeatedly carries a bearer token and
+# returns authority-bearing config, so an http:// value disables the poller with
+# a warning (the one-shot `witness setup` may still use http:// deliberately).
+# TRUST MODEL: the server is the root of config authority and may change ANY
+# field, INCLUDING api_key and endpoint; such changes are logged loudly. TLS
+# certificate verification authenticates the server (never disabled).
 # server = "https://tell.rs"
+
+# Remote config poll interval (default 5m, supports ms/s/m/h). "0s" disables
+# polling even when `server` is set. Only meaningful when `server` is set.
+# config_poll_interval = "5m"
 
 # Hostname override (auto-detected if omitted)
 # hostname = "my-server"
@@ -23,22 +35,112 @@ api_key = "feed1e11feed1e11feed1e11feed1e11"
 # Maximum disk buffer size in bytes (default: 3 GiB)
 # buffer_max_bytes = 3221225472
 
-# Log source: "auto", "journald", or "files" (default: auto).
-# auto uses journald when available, falls back to file tailing.
+# Log source: "auto", "journald", "unifiedlog" (alias "unified"),
+# "eventlog" (alias "event_log"), or "files" (default: auto). Resolution of
+# "auto" is per-platform:
+#   Linux   — journald when available, else file tailing.
+#   macOS   — the unified log (via /usr/bin/log) when available, else file tailing.
+#   Windows — the Windows Event Log (always available), else file tailing.
+# "unifiedlog" is macOS-only and "eventlog" is Windows-only; each errors at
+# startup on the wrong platform.
 # log_source = "auto"
+
+# macOS unified log: raw --predicate override. When set, REPLACES the built-in
+# default (error + fault + curated security signal) and is passed verbatim to
+# /usr/bin/log. Ignored off macOS. Example — add a subsystem at default level:
+# unified_log_predicate = '(messageType == "error" OR messageType == "fault") OR subsystem == "com.apple.TCC"'
+
+# Windows Event Log: channels to subscribe to (default: System, Application,
+# Security). The Security channel needs SeSecurityPrivilege (the LocalSystem
+# service account has it); on access-denied it is skipped with a warning.
+# Inert off Windows.
+# eventlog_channels = ["System", "Application", "Security"]
+
+# Windows Event Log: raw XPath query override. When set, REPLACES the built-in
+# default (Level 0-4 — everything except Verbose) and is passed verbatim to
+# EvtSubscribe. Inert off Windows.
+# eventlog_query = "*[System[(Level=1 or Level=2 or Level=3)]]"
+
+# Windows Event Log: event-id filter (Winlogbeat syntax). Comma list; plain N =
+# include, N-M = include range, -N / -N-M = exclude. If any includes are
+# present an event must match an include AND no exclude; excludes alone mean
+# "everything except". An invalid spec fails at startup. Applied agent-side.
+# eventlog_event_ids = "4624,4625,4700-4800,-4735"
+#
+# Canonical noisy-ID starter exclude list — SOCs tune this to taste:
+#   Security handle churn: 4658,4690,4656,4663,4660,4670
+#   Windows Filtering Platform: 5152,5156,5157,5158,5447
+#   Misc high-volume: 5145,4703,4907,4634,4689
+#   System service-state spam: 7036
+# eventlog_event_ids = "-4658,-4690,-4656,-4663,-4660,-4670,-5152,-5156,-5157,-5158,-5447,-5145,-4703,-4907,-4634,-4689,-7036"
+
+# Windows Event Log: providers to drop entirely (case-insensitive exact match
+# on Provider Name), applied agent-side. Inert off Windows.
+# eventlog_exclude_providers = ["Microsoft-Windows-WMI-Activity"]
+
+# journald: service include/exclude by resolved program name (SYSLOG_IDENTIFIER
+# / _COMM), case-sensitive exact. Empty include = allow all; exclude wins over
+# include. The Linux member of the same filter family as eventlog_event_ids
+# (Windows) and unified_log_predicate (macOS).
+# journal_include_services = ["sshd", "nginx", "postgres"]
+# journal_exclude_services = ["cron"]
 
 # File tailing settings (only apply when log_source is "files" or fallback).
 # Log paths default per platform if omitted. Set to [] to disable.
+# On Windows the default is EMPTY (the Event Log is the primary source); enable
+# file tailing explicitly for plaintext logs that do NOT go to the Event Log.
+# Use FORWARD SLASHES on Windows (the glob crate treats "\" as an escape):
+#   IIS site access logs:  "C:/inetpub/logs/LogFiles/W3SVC*/*.log"
+#   Service/HTTPERR logs:  "C:/Windows/System32/LogFiles/**/*.log"
 # logs = ["/var/log/myapp/*.log"]
+#
+# parse_syslog: strip an RFC 3164 / ISO 8601 syslog envelope, extracting the
+# program name as the service and the remainder as the message body. Default: true.
 # parse_syslog = true
+#
+# parse_structured: pull JSON or logfmt structure out of a line (after any
+# syslog envelope) — the event phrase becomes the message body and the remaining
+# key=value / JSON fields ship as a structured payload, the same treatment
+# journald MESSAGE fields get. Default: true.
+# parse_structured = true
+#
+# detect_levels: recover a log severity for each line. A structured
+# level/severity/lvl field (JSON or logfmt) is used first and consumed from the
+# payload; otherwise a cheap heuristic scans the start of the line for a
+# delimited level token (" ERROR ", "[error]", "level=error"). Without this every
+# file line ships as Info. Default: true.
+# detect_levels = true
+#
+# Multiline aggregation (spec 008): merge consecutive physical lines into one
+# record (stack traces, pretty-printed JSON, multi-line panics). A regex matched
+# against each complete line marks the START of a record; every following
+# non-matching line is appended until the next start-match, the inactivity
+# timeout, or the byte cap. Omit to disable (one entry per line — the default).
+# ONLY applies on the file-tailing path — inert for journald / unified log /
+# Event Log, which already deliver whole records. "Find anywhere" semantics;
+# anchor with ^ for "line begins with". Invalid regex = startup config error.
+# multiline_start_pattern = "^\\d{4}-\\d{2}-\\d{2}"   # ISO-8601 timestamp prefix
+#
+# multiline_timeout_ms: inactivity flush — a buffered record with no new bytes
+# for this long ships so an idle file's last record is not held forever.
+# Default 1000. Only meaningful with multiline_start_pattern set.
+# multiline_timeout_ms = 1000
+#
+# multiline_max_bytes: per-record byte cap (char-boundary-safe drop-excess
+# truncation), bounding memory for a pathological never-ending record. Default
+# 1 MiB. Only meaningful with multiline_start_pattern set.
+# multiline_max_bytes = 1048576
 
 # Global tags — applied to all metrics and logs
 # [tags]
 # env = "production"
 # role = "web"
 
-# System monitoring — all collectors enabled by default.
-# Only add [system] to override specific collectors.
+# System monitoring. Per-platform defaults, identical config format:
+#   Linux — ALL collectors ON by default; add [system] only to disable some.
+#   macOS — log-forwarder-first: ALL collectors OFF by default. Add a [system]
+#           table listing the collectors you want (e.g. cpu = true). This same
+#           file is portable to Linux unchanged.
 # [system]
 # cpu = true
 # memory = true
