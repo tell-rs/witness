@@ -18,13 +18,14 @@
 //! re-seeks to `pos` and re-derives the same unshipped record from the file.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufReader, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 
 use regex_lite::Regex;
 
 use super::structured::{FileParseOpts, classify_line};
-use super::watcher::{MAX_LINES_PER_POLL, TailedFile, push_partial};
+use super::text;
+use super::watcher::{MAX_LINES_PER_POLL, READ_BUF_BYTES, TailedFile, push_partial};
 use crate::sink::Sink;
 
 /// Compiled, shared multiline settings — built once per tailer in `tail_files`
@@ -109,7 +110,7 @@ pub(crate) fn read_live(
 ) -> u64 {
     ensure_agg(tailed);
     let read_from = tailed.agg.as_ref().map_or(tailed.pos, |a| a.read_ahead);
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(READ_BUF_BYTES, file);
     if reader.seek(SeekFrom::Start(read_from)).is_err() {
         return 0;
     }
@@ -135,7 +136,7 @@ pub(crate) fn drain(
     };
     ensure_agg(tailed);
     let read_from = tailed.agg.as_ref().map_or(tailed.pos, |a| a.read_ahead);
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(READ_BUF_BYTES, file);
     if reader.seek(SeekFrom::Start(read_from)).is_err() {
         return 0;
     }
@@ -199,7 +200,7 @@ fn read_loop(
     let mut buf = Vec::new();
     let reason = loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
+        match text::read_line(reader, &mut buf) {
             Ok(0) => break StopReason::Eof,
             Ok(n) => {
                 if buf.last() == Some(&b'\n') {
@@ -241,7 +242,7 @@ fn commit_line(
     opts: FileParseOpts,
     ml: &MultilineOpts,
 ) -> Commit {
-    let line_lossy = String::from_utf8_lossy(line_bytes);
+    let line_lossy = text::lossy(line_bytes);
     let complete: String = if tailed.partial.is_empty() {
         line_lossy.into_owned()
     } else {

@@ -168,6 +168,7 @@ endpoint = "127.0.0.1:{RECEIVER_PORT}"
 hostname = "bench"
 interval = "60s"
 batch_size = 500
+log_source = "files"
 logs = ["{log_path}"]
 
 [system]
@@ -556,9 +557,11 @@ const VECTOR_BIN: &str = "../vector/target/release/vector";
 fn kill_leftover_processes() {
     use std::process::Command as StdCommand;
     for name in ["witness", "vector"] {
-        // pkill by name — ignore errors (nothing to kill is fine)
+        // pkill by exact process name — `-f` would match any command line
+        // containing the word (editors, shells, agents in a witness checkout).
+        // Ignore errors (nothing to kill is fine).
         let _ = StdCommand::new("pkill")
-            .args(["-f", name])
+            .args(["-x", name])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();

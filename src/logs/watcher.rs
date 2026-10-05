@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -26,6 +26,7 @@ use tracing::{info, warn};
 
 use super::multiline::{self, MultilineOpts};
 use super::structured::{FileParseOpts, classify_line};
+use super::text;
 use crate::sink::Sink;
 
 /// How often to poll files for new content (ms). Backs off when idle.
@@ -52,6 +53,9 @@ const MAX_PARTIAL_BYTES: usize = 1024 * 1024;
 /// backpressure mechanism is try_log() returning false (channel full), not
 /// this cap — it only prevents monopolising the executor under sustained load.
 pub(crate) const MAX_LINES_PER_POLL: usize = 32_000;
+/// Read buffer per poll. 8x std's default: one `read` syscall per ~800 typical
+/// lines instead of ~100 (~3 ns/line on catch-up). Lives only for one poll.
+pub(crate) const READ_BUF_BYTES: usize = 64 * 1024;
 /// When draining a large backlog (pos far behind file end), use faster 50ms
 /// polls instead of the default 250ms base.
 const POLL_CATCHUP_MS: u64 = 50;
@@ -729,7 +733,7 @@ pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, opts: FilePar
         return 0;
     };
 
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(READ_BUF_BYTES, file);
     if reader.seek(SeekFrom::Start(tailed.pos)).is_err() {
         return 0;
     }
@@ -740,7 +744,7 @@ pub(crate) fn drain_retained(tailed: &mut TailedFile, sink: &Sink, opts: FilePar
 
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
+        match text::read_line(&mut reader, &mut buf) {
             Ok(0) => break, // EOF — old file fully drained
             Ok(n) => {
                 if buf.last() == Some(&b'\n') {
@@ -778,7 +782,7 @@ pub(crate) fn push_partial(partial: &mut String, bytes: &[u8]) {
     if partial.len() >= MAX_PARTIAL_BYTES {
         return;
     }
-    partial.push_str(&String::from_utf8_lossy(bytes));
+    partial.push_str(&text::lossy(bytes));
     if partial.len() > MAX_PARTIAL_BYTES {
         partial.truncate(partial.floor_char_boundary(MAX_PARTIAL_BYTES));
     }
@@ -796,7 +800,7 @@ pub(crate) fn read_lines(
     sink: &Sink,
     opts: FileParseOpts,
 ) -> u64 {
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(READ_BUF_BYTES, file);
     if reader.seek(SeekFrom::Start(tailed.pos)).is_err() {
         return 0;
     }
@@ -807,7 +811,7 @@ pub(crate) fn read_lines(
 
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
+        match text::read_line(&mut reader, &mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 if buf.last() == Some(&b'\n') {
@@ -847,7 +851,7 @@ pub(crate) fn try_emit_line(
     sink: &Sink,
     opts: FileParseOpts,
 ) -> bool {
-    let line_lossy = String::from_utf8_lossy(line_bytes);
+    let line_lossy = text::lossy(line_bytes);
 
     let complete: std::borrow::Cow<'_, str> = if partial.is_empty() {
         std::borrow::Cow::Borrowed(line_lossy.as_ref())

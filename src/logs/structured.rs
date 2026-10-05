@@ -161,22 +161,20 @@ pub fn split_message(message: &str) -> (std::borrow::Cow<'_, str>, Option<serde_
 
 /// Scan for the byte offset of the space preceding the first `key=value`
 /// token. Returns `None` if no logfmt-shaped tail is present.
-fn logfmt_field_start(s: &str) -> Option<usize> {
+///
+/// Anchors on `=` (rare in prose, SIMD-searched) and walks back over the key,
+/// rather than probing at every space. Key runs of distinct matches are
+/// disjoint, so the first matching `=` yields the first matching space.
+pub(crate) fn logfmt_field_start(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b' ' {
-            // Look ahead for `<ident>=` at bytes[i+1..]
-            let start = i + 1;
-            let mut j = start;
-            while j < bytes.len() && is_logfmt_key_byte(bytes[j]) {
-                j += 1;
-            }
-            if j > start && j < bytes.len() && bytes[j] == b'=' {
-                return Some(i);
-            }
+    for eq in memchr::memchr_iter(b'=', bytes) {
+        let mut k = eq;
+        while k > 0 && is_logfmt_key_byte(bytes[k - 1]) {
+            k -= 1;
         }
-        i += 1;
+        if k < eq && k > 0 && bytes[k - 1] == b' ' {
+            return Some(k - 1);
+        }
     }
     None
 }

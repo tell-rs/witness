@@ -15,6 +15,7 @@ pub mod multiline;
 pub mod source;
 pub mod structured;
 pub mod syslog;
+pub(crate) mod text;
 pub mod unified;
 pub mod unified_parse;
 pub mod watcher;
@@ -46,6 +47,8 @@ mod source_test;
 mod structured_test;
 #[cfg(test)]
 mod syslog_test;
+#[cfg(test)]
+mod text_test;
 #[cfg(test)]
 mod unified_test;
 #[cfg(test)]

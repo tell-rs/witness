@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.1
+
+Changed:
+- logs: faster file tailing — SIMD newline search, SIMD UTF-8 validation, an `=`-anchored logfmt field scan, and a 64 KiB read buffer cut per-line overhead by ~45 ns; ~2.5% higher end-to-end shipping throughput, output byte-for-byte unchanged
+
+Fix:
+- benchmark: the throughput benchmark tails the log file again (it was silently reading the macOS unified log), and its cleanup kills only processes named witness or vector instead of anything with "witness" in its command line
+
 ## v0.5.0
 
 New:
