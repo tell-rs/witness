@@ -17,10 +17,10 @@ jobs:
   # since tag pushes don't wait for the CI workflow.
   test:
     name: Test before release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.93.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -41,7 +41,7 @@ jobs:
       matrix:
         include:
           - os_arch: linux-x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             rust_target: x86_64-unknown-linux-musl
           - os_arch: linux-aarch64
             runner: ubuntu-24.04-arm
@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Get version from tag
         run: |
@@ -98,7 +98,7 @@ jobs:
           echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> $GITHUB_ENV
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.os_arch }}
           path: dist/witness-${{ env.VERSION }}-${{ matrix.os_arch }}.tgz*
@@ -106,13 +106,13 @@ jobs:
   release:
     name: Create Release
     needs: [build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+Changed:
+- ci: GitHub Actions moved to Node 24 releases (checkout v7, upload-artifact v7, download-artifact v8) ahead of the Node 20 removal, and runners pinned to Ubuntu 24.04 so the ubuntu-latest switch to Ubuntu 26 can't silently change release builds; setup-zig stays on v2 until it ships a Node 24 release
+
 ## v0.6.0
 
 New:
