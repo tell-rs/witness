@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.6.0
+
+New:
+- metrics: disk alerting metrics — `system.disk.available_bytes` (what a non-root process can still write, df's "Avail") and `system.disk.used_percent` (df's "Use%", reads 100% once only root-reserved blocks remain), plus `system.disk.inodes_used_percent`, on Linux and macOS
+- metrics: `disk_fs_types` under `[system]` chooses which filesystem types report disk space; network filesystems (nfs, nfs4, cifs, smbfs, ceph) can now be opted in
+- metrics: a hung mount can no longer stall metrics — a filesystem that doesn't answer within 2s is skipped (logged once) and picked up again when it responds, while every other metric keeps flowing
+
+Changed:
+- metrics: each filesystem reports once — bind mounts of the same device (`/var/lib/witness`, `/var/tmp` on the root volume) no longer duplicate the `/` series; the shortest mount point wins
+- metrics: Linux and macOS share one disk-space implementation; exfat and ntfs3 join the default Linux filesystem types
+
+Fix:
+- metrics: mount points containing spaces or other escaped characters in /proc/mounts report disk space instead of being silently skipped
+
 ## v0.5.1
 
 Changed:

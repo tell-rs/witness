@@ -1,23 +1,28 @@
 //! Disk collector — uses statvfs() for space.
 //!
-//! Emits gauges: system.disk.total_bytes, .used_bytes, .free_bytes
-//! Emits gauges: system.disk.inodes_total, .inodes_used, .inodes_free
+//! Emits space gauges per filesystem — see `metrics::disk_space`.
 //!
 //! Only reports `/` and `/Volumes/*` mounts. Deduplicates mounts that share
 //! the same underlying APFS container (same total + free bytes).
 
 use std::collections::HashSet;
-use std::ffi::CString;
-use std::mem::MaybeUninit;
 
 use crate::config::DeviceFilter;
 use crate::metrics::Collector;
+use crate::metrics::disk_space::{SpaceReader, fs_type_allowed};
 use crate::sink::Sink;
+
+/// Local filesystems reported by default. Network shares (smbfs, nfs, afpfs)
+/// are opt-in via `disk_fs_types`; a hung server is skipped after
+/// `STATVFS_TIMEOUT` rather than stalling the tick.
+const DEFAULT_FS_TYPES: &[&str] = &["apfs", "hfs", "msdos", "exfat", "ufs", "zfs"];
 
 pub struct DiskCollector {
     mounts: Vec<MountInfo>,
     filter: DeviceFilter,
+    fs_types: Vec<String>,
     tick_count: u32,
+    space: SpaceReader,
 }
 
 struct MountInfo {
@@ -26,11 +31,13 @@ struct MountInfo {
 }
 
 impl DiskCollector {
-    pub fn new(filter: DeviceFilter) -> Self {
+    pub fn new(filter: DeviceFilter, fs_types: Vec<String>) -> Self {
         Self {
             mounts: Vec::new(),
             filter,
+            fs_types,
             tick_count: 0,
+            space: SpaceReader::default(),
         }
     }
 }
@@ -43,69 +50,39 @@ impl Collector for DiskCollector {
     fn collect(&mut self, sink: &Sink, _hostname: &str, _buf: &mut String) {
         // Refresh mounts every 30 ticks
         if self.tick_count.is_multiple_of(30) {
-            self.mounts = discover_mounts(&self.filter);
+            self.mounts = discover_mounts(&self.filter, &self.fs_types);
+            self.space
+                .retain_mounts(self.mounts.iter().map(|m| m.mount_point.as_str()));
         }
         self.tick_count = self.tick_count.wrapping_add(1);
 
-        collect_disk_space(sink, &self.mounts);
+        collect_disk_space(sink, &mut self.space, &self.mounts);
     }
 }
 
-fn collect_disk_space(sink: &Sink, mounts: &[MountInfo]) {
+fn collect_disk_space(sink: &Sink, space: &mut SpaceReader, mounts: &[MountInfo]) {
     // Deduplicate APFS container-shared volumes: multiple mounts can report
     // identical (total, free) because they share the same physical container.
     // Only emit the first one (shortest mount path wins from discover_mounts).
-    let mut seen: HashSet<(libc::fsblkcnt_t, libc::fsblkcnt_t)> = HashSet::new();
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
 
     for mount in mounts {
-        let Ok(c_path) = CString::new(mount.mount_point.as_bytes()) else {
+        let Some(stats) = space.read(&mount.mount_point) else {
             continue;
         };
-
-        let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
-        let ret = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
-        if ret != 0 {
+        if !seen.insert((stats.total.to_bits(), stats.free.to_bits())) {
             continue;
         }
-
-        let stat = unsafe { stat.assume_init() };
-        let bs = stat.f_frsize as f64;
-        let total = stat.f_blocks as f64 * bs;
-        let free = stat.f_bfree as f64 * bs;
-        if total == 0.0 {
-            continue;
-        }
-
-        // Skip if we already emitted a mount with identical space (APFS dedup)
-        let key = (stat.f_blocks, stat.f_bfree);
-        if !seen.insert(key) {
-            continue;
-        }
-
         let labels: &[(&'static str, &str)] =
             &[("mount", &mount.mount_point), ("device", &mount.device)];
-        sink.gauge_dyn("system.disk.total_bytes", total, labels);
-        sink.gauge_dyn("system.disk.used_bytes", total - free, labels);
-        sink.gauge_dyn("system.disk.free_bytes", free, labels);
-
-        let inodes_total = stat.f_files as f64;
-        let inodes_free = stat.f_ffree as f64;
-        if inodes_total > 0.0 {
-            sink.gauge_dyn("system.disk.inodes_total", inodes_total, labels);
-            sink.gauge_dyn(
-                "system.disk.inodes_used",
-                inodes_total - inodes_free,
-                labels,
-            );
-            sink.gauge_dyn("system.disk.inodes_free", inodes_free, labels);
-        }
+        stats.emit(sink, labels);
     }
 }
 
 /// Discover mounted filesystems. Only reports mounts at `/` or under `/Volumes/`
 /// (external drives, network shares). Sorted by mount path length so shortest
 /// path wins during APFS dedup.
-fn discover_mounts(filter: &DeviceFilter) -> Vec<MountInfo> {
+fn discover_mounts(filter: &DeviceFilter, fs_types: &[String]) -> Vec<MountInfo> {
     let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
     if count <= 0 {
         return Vec::new();
@@ -125,11 +102,7 @@ fn discover_mounts(filter: &DeviceFilter) -> Vec<MountInfo> {
             let fstype =
                 unsafe { std::ffi::CStr::from_ptr(fs.f_fstypename.as_ptr()) }.to_string_lossy();
 
-            // Only real filesystems
-            if !matches!(
-                fstype.as_ref(),
-                "apfs" | "hfs" | "msdos" | "exfat" | "ufs" | "zfs"
-            ) {
+            if !fs_type_allowed(&fstype, fs_types, DEFAULT_FS_TYPES) {
                 return None;
             }
 

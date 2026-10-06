@@ -162,3 +162,12 @@ api_key = "feed1e11feed1e11feed1e11feed1e11"
 # [system.disk_filter]
 # include = ["sd*", "nvme*"]
 # exclude = ["loop*", "dm-*"]
+
+# Filesystem types reported for disk space (under [system]). Default: local
+# filesystems only — Linux: ext2/3/4, xfs, btrfs, zfs, vfat, exfat, ntfs,
+# ntfs3, f2fs; macOS: apfs, hfs, msdos, exfat, ufs, zfs. Setting this replaces
+# the default, so list your local types too. Network filesystems (nfs, nfs4,
+# cifs, smbfs, ceph) are opt-in. A mount whose server hangs is skipped after
+# a 2s timeout (logged once) and picked up again when it responds; other
+# metrics keep flowing.
+# disk_fs_types = ["ext4", "xfs", "nfs4"]

@@ -55,7 +55,7 @@ Collected every 15 seconds (configurable). All enabled by default, individually 
 - **CPU** — per-core user, system, idle, iowait, and steal percentages
 - **Memory** — total, available, used, cached, and swap
 - **Load** — 1, 5, and 15 minute averages
-- **Disk** — read/write bytes and ops per device, filesystem space per mount
+- **Disk** — read/write bytes and ops per device; space, available bytes, used percent, and inodes per filesystem
 - **Network** — bytes, packets, errors, and drops per interface
 - **TCP** — connection counts by state
 - **cgroups** — container-aware CPU and memory from cgroups v2

@@ -332,6 +332,30 @@ fn system_config_default_impl_matches_serde() {
     assert_eq!(parsed.processes, defaulted.processes);
 }
 
+#[test]
+fn disk_fs_types_default_empty() {
+    let cfg = parse(r#"api_key = "aaaa1111bbbb2222cccc3333dddd4444""#);
+    assert!(cfg.system.disk_fs_types.is_empty());
+    assert!(
+        crate::config::SystemConfig::default()
+            .disk_fs_types
+            .is_empty()
+    );
+}
+
+#[test]
+fn disk_fs_types_explicit() {
+    let cfg = parse(
+        r#"
+api_key = "aaaa1111bbbb2222cccc3333dddd4444"
+
+[system]
+disk_fs_types = ["ext4", "xfs", "nfs4"]
+"#,
+    );
+    assert_eq!(cfg.system.disk_fs_types, ["ext4", "xfs", "nfs4"]);
+}
+
 /// Explicit opt-in works and the format is identical to Linux: `cpu = true`
 /// under `[system]` enables cpu; on macOS the rest stay disabled.
 #[test]

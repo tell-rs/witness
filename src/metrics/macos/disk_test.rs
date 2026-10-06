@@ -10,7 +10,7 @@ fn test_sink() -> Sink {
 fn disk_collects_without_panic() {
     let sink = test_sink();
     let filter = DeviceFilter::new(&FilterConfig::default(), &[]);
-    let mut collector = super::disk::DiskCollector::new(filter);
+    let mut collector = super::disk::DiskCollector::new(filter, Vec::new());
     let mut buf = String::new();
 
     collector.collect(&sink, "test", &mut buf);
@@ -19,7 +19,7 @@ fn disk_collects_without_panic() {
 #[test]
 fn disk_checkpoint_is_noop() {
     let filter = DeviceFilter::new(&FilterConfig::default(), &[]);
-    let mut collector = super::disk::DiskCollector::new(filter);
+    let mut collector = super::disk::DiskCollector::new(filter, Vec::new());
     let mut buf = String::new();
 
     // Collect once so collector is initialized

@@ -251,6 +251,12 @@ pub struct SystemConfig {
     /// Disk device filtering.
     #[serde(default)]
     pub disk_filter: FilterConfig,
+
+    /// Filesystem types reported for disk space. Empty = platform default
+    /// (local filesystems only). A non-empty list replaces the default, so
+    /// list the local types too when adding e.g. `nfs4`.
+    #[serde(default)]
+    pub disk_fs_types: Vec<String>,
 }
 
 /// Include/exclude glob filter.
@@ -280,6 +286,7 @@ impl Default for SystemConfig {
             process_top: default_top_n(),
             network_filter: FilterConfig::default(),
             disk_filter: FilterConfig::default(),
+            disk_fs_types: Vec::new(),
         }
     }
 }

@@ -1,26 +1,36 @@
 //! Disk collector — reads /proc/diskstats + statvfs() for space.
 //!
 //! Emits counters (delta): system.disk.read_bytes, .write_bytes, .read_ops, .write_ops
-//! Emits gauges: system.disk.total_bytes, .used_bytes, .free_bytes
-//! Emits gauges: system.disk.inodes_total, .inodes_used, .inodes_free
+//! Emits space gauges per filesystem — see `metrics::disk_space`.
+//!
+//! Each device is reported once, at its shortest mount point: bind mounts
+//! (`/var/lib/foo` on the same LV as `/`) would otherwise duplicate the series.
 
-use std::collections::HashMap;
-use std::ffi::CString;
-use std::mem::MaybeUninit;
+use std::collections::{HashMap, HashSet};
 
 use tell::Temporality;
 
 use crate::config::DeviceFilter;
+use crate::metrics::disk_space::{SpaceReader, fs_type_allowed};
 use crate::metrics::{Collector, read_procfs};
 use crate::sink::Sink;
 
 const SECTOR_SIZE: f64 = 512.0;
 
+/// Local filesystems reported by default. Network filesystems (nfs, cifs,
+/// ceph, fuse.*) are opt-in via `disk_fs_types`; a hung server is skipped
+/// after `STATVFS_TIMEOUT` rather than stalling the tick.
+const DEFAULT_FS_TYPES: &[&str] = &[
+    "ext4", "ext3", "ext2", "xfs", "btrfs", "zfs", "vfat", "exfat", "ntfs", "ntfs3", "f2fs",
+];
+
 pub struct DiskCollector {
     prev: HashMap<String, DiskStats>,
     mounts: Vec<MountInfo>,
     filter: DeviceFilter,
+    fs_types: Vec<String>,
     tick_count: u32,
+    space: SpaceReader,
 }
 
 #[derive(Clone, Default)]
@@ -31,18 +41,21 @@ struct DiskStats {
     sectors_written: u64,
 }
 
-struct MountInfo {
-    device: String,
-    mount_point: String,
+#[derive(Debug, PartialEq)]
+pub(crate) struct MountInfo {
+    pub(crate) device: String,
+    pub(crate) mount_point: String,
 }
 
 impl DiskCollector {
-    pub fn new(filter: DeviceFilter) -> Self {
+    pub fn new(filter: DeviceFilter, fs_types: Vec<String>) -> Self {
         Self {
             prev: HashMap::new(),
             mounts: Vec::new(),
             filter,
+            fs_types,
             tick_count: 0,
+            space: SpaceReader::default(),
         }
     }
 }
@@ -61,12 +74,14 @@ impl Collector for DiskCollector {
         // Refresh mounts every 30 ticks (~5 min at 10s interval)
         if self.tick_count.is_multiple_of(30) {
             if read_procfs("/proc/mounts", buf).is_ok() {
-                self.mounts = parse_mounts(buf);
+                self.mounts = parse_mounts(buf, &self.fs_types);
+                self.space
+                    .retain_mounts(self.mounts.iter().map(|m| m.mount_point.as_str()));
             }
         }
         self.tick_count = self.tick_count.wrapping_add(1);
 
-        collect_disk_space(sink, &self.mounts);
+        collect_disk_space(sink, &mut self.space, &self.mounts);
     }
 
     fn checkpoint(&mut self, sink: &Sink, _hostname: &str) {
@@ -152,43 +167,14 @@ fn collect_diskstats(
     }
 }
 
-fn collect_disk_space(sink: &Sink, mounts: &[MountInfo]) {
+fn collect_disk_space(sink: &Sink, space: &mut SpaceReader, mounts: &[MountInfo]) {
     for mount in mounts {
-        let Ok(c_path) = CString::new(mount.mount_point.as_bytes()) else {
+        let Some(stats) = space.read(&mount.mount_point) else {
             continue;
         };
-
-        let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
-        let ret = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
-        if ret != 0 {
-            continue;
-        }
-
-        let stat = unsafe { stat.assume_init() };
-        let bs = stat.f_frsize as f64;
-        let total = stat.f_blocks as f64 * bs;
-        let free = stat.f_bfree as f64 * bs;
-        if total == 0.0 {
-            continue;
-        }
-
         let labels: &[(&'static str, &str)] =
             &[("mount", &mount.mount_point), ("device", &mount.device)];
-        sink.gauge_dyn("system.disk.total_bytes", total, labels);
-        sink.gauge_dyn("system.disk.used_bytes", total - free, labels);
-        sink.gauge_dyn("system.disk.free_bytes", free, labels);
-
-        let inodes_total = stat.f_files as f64;
-        let inodes_free = stat.f_ffree as f64;
-        if inodes_total > 0.0 {
-            sink.gauge_dyn("system.disk.inodes_total", inodes_total, labels);
-            sink.gauge_dyn(
-                "system.disk.inodes_used",
-                inodes_total - inodes_free,
-                labels,
-            );
-            sink.gauge_dyn("system.disk.inodes_free", inodes_free, labels);
-        }
+        stats.emit(sink, labels);
     }
 }
 
@@ -214,24 +200,59 @@ impl DiskCollector {
     }
 }
 
-fn parse_mounts(buf: &str) -> Vec<MountInfo> {
-    buf.lines()
+/// Parse /proc/mounts into the mounts to report: allowed filesystem types,
+/// one entry per device (shortest mount point wins).
+pub(crate) fn parse_mounts(buf: &str, fs_types: &[String]) -> Vec<MountInfo> {
+    let mut mounts: Vec<MountInfo> = buf
+        .lines()
         .filter_map(|line| {
             let mut it = line.split_whitespace();
             let (Some(device), Some(mount_point), Some(fs)) = (it.next(), it.next(), it.next())
             else {
                 return None;
             };
-            if !matches!(
-                fs,
-                "ext4" | "ext3" | "ext2" | "xfs" | "btrfs" | "zfs" | "vfat" | "ntfs" | "f2fs"
-            ) {
+            if !fs_type_allowed(fs, fs_types, DEFAULT_FS_TYPES) {
                 return None;
             }
             Some(MountInfo {
-                device: device.to_string(),
-                mount_point: mount_point.to_string(),
+                device: unescape_mount_field(device),
+                mount_point: unescape_mount_field(mount_point),
             })
         })
-        .collect()
+        .collect();
+
+    // Stable sort keeps /proc/mounts order among equal lengths.
+    mounts.sort_by_key(|m| m.mount_point.len());
+    let mut seen = HashSet::new();
+    mounts.retain(|m| seen.insert(m.device.clone()));
+    mounts
+}
+
+/// Decode the octal escapes the kernel writes in /proc/mounts fields
+/// (`\040` space, `\011` tab, `\012` newline, `\134` backslash).
+fn unescape_mount_field(field: &str) -> String {
+    if !field.contains('\\') {
+        return field.to_string();
+    }
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // First digit 0-3 keeps the value within a byte (max \377).
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && (b'0'..=b'3').contains(&bytes[i + 1])
+            && bytes[i + 2..=i + 3]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
+        {
+            let v = (bytes[i + 1] - b'0') * 64 + (bytes[i + 2] - b'0') * 8 + (bytes[i + 3] - b'0');
+            out.push(v);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

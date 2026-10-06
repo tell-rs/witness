@@ -45,10 +45,10 @@ pub fn init_collectors(config: &SystemConfig) -> Vec<Box<dyn Collector>> {
         collectors.push(Box::new(cpu::CpuCollector::new()));
     }
     if config.disk {
-        collectors.push(Box::new(disk::DiskCollector::new(DeviceFilter::new(
-            &config.disk_filter,
-            &["ram*", "loop*", "dm-*"],
-        ))));
+        collectors.push(Box::new(disk::DiskCollector::new(
+            DeviceFilter::new(&config.disk_filter, &["ram*", "loop*", "dm-*"]),
+            config.disk_fs_types.clone(),
+        )));
     }
     if config.network {
         collectors.push(Box::new(network::NetworkCollector::new(DeviceFilter::new(
