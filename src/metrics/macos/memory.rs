@@ -1,8 +1,13 @@
 //! Memory collector — uses mach host_statistics64() + sysctl.
 //!
 //! Emits gauges (bytes): system.memory.total, .available, .used, .cached, .swap_used
+//! and gauges (percentage, 0-100): system.memory.used_percent, and
+//! system.memory.swap_used_percent when swap is configured (total > 0).
+//! "available" here is free + inactive + purgeable pages; see
+//! `metrics::derived` for the exact definitions.
 
 use crate::metrics::Collector;
+use crate::metrics::derived::{memory_used_percent, swap_used_percent};
 use crate::sink::Sink;
 
 pub struct MemoryCollector;
@@ -34,14 +39,19 @@ impl Collector for MemoryCollector {
                 t.saturating_sub(available) as f64,
                 &[],
             );
+            if let Some(pct) = memory_used_percent(t as f64, available as f64) {
+                sink.gauge("system.memory.used_percent", pct, &[]);
+            }
         }
         sink.gauge("system.memory.available", available as f64, &[]);
         sink.gauge("system.memory.cached", cached as f64, &[]);
 
         // Swap
-        let swap = read_swap_usage();
-        if let Some((used, _total)) = swap {
+        if let Some((used, total)) = read_swap_usage() {
             sink.gauge("system.memory.swap_used", used as f64, &[]);
+            if let Some(pct) = swap_used_percent(total as f64, used as f64) {
+                sink.gauge("system.memory.swap_used_percent", pct, &[]);
+            }
         }
     }
 }

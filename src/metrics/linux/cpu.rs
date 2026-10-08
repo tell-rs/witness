@@ -3,10 +3,17 @@
 //! Emits gauges (percentage, 0-100):
 //! - system.cpu.user, .system, .idle, .iowait, .steal
 //!   Labels: {core: "total"} or {core: "0"}, {core: "1"}, ...
-//!   First tick stores baseline — no metrics emitted until second tick.
+//! - system.cpu.busy_percent = 100 - idle, all CPUs only ({core: "total"});
+//!   iowait and steal count as busy.
+//!
+//! And an unlabeled gauge: system.cpu.count (online logical CPUs, the
+//! number of cpuN rows in /proc/stat).
+//!
+//! First tick stores baseline — no metrics emitted until second tick.
 
 use std::collections::HashMap;
 
+use crate::metrics::derived::cpu_busy_percent;
 use crate::metrics::{Collector, read_procfs};
 use crate::sink::Sink;
 
@@ -27,6 +34,11 @@ pub(crate) struct CpuTimes {
 }
 
 impl CpuTimes {
+    /// Kernel time: system + irq + softirq (reported as system.cpu.system).
+    fn kernel(&self) -> u64 {
+        self.system + self.irq + self.softirq
+    }
+
     pub(crate) fn total(&self) -> u64 {
         self.user
             + self.nice
@@ -57,62 +69,74 @@ impl Collector for CpuCollector {
             return;
         }
 
+        let mut cores = 0usize;
+        let mut had_baseline = false;
         for line in buf.lines() {
-            if !line.starts_with("cpu") {
-                continue;
-            }
-
             let mut parts = line.split_whitespace();
             let Some(cpu_name) = parts.next() else {
                 continue;
             };
-
-            let is_total = cpu_name == "cpu";
-            let is_core = cpu_name.len() > 3
-                && cpu_name.as_bytes()[..3] == *b"cpu"
-                && cpu_name[3..].bytes().all(|b| b.is_ascii_digit());
-
-            if !is_total && !is_core {
+            let Some(label) = cpu_label(cpu_name) else {
                 continue;
+            };
+            if label != "total" {
+                cores += 1;
             }
 
             let current = parse_cpu_line(&mut parts);
-            let label: &str = if is_total { "total" } else { &cpu_name[3..] };
-
             if let Some(prev_val) = self.prev.get_mut(cpu_name) {
-                let dt = current.total().saturating_sub(prev_val.total());
-                if dt > 0 {
-                    let d = dt as f64;
-                    let labels: &[(&'static str, &str)] = &[("core", label)];
-
-                    let du =
-                        (current.user + current.nice).saturating_sub(prev_val.user + prev_val.nice);
-                    sink.gauge_dyn("system.cpu.user", du as f64 / d * 100.0, labels);
-
-                    let ds = (current.system + current.irq + current.softirq)
-                        .saturating_sub(prev_val.system + prev_val.irq + prev_val.softirq);
-                    sink.gauge_dyn("system.cpu.system", ds as f64 / d * 100.0, labels);
-
-                    sink.gauge_dyn(
-                        "system.cpu.idle",
-                        current.idle.saturating_sub(prev_val.idle) as f64 / d * 100.0,
-                        labels,
-                    );
-                    sink.gauge_dyn(
-                        "system.cpu.iowait",
-                        current.iowait.saturating_sub(prev_val.iowait) as f64 / d * 100.0,
-                        labels,
-                    );
-                    sink.gauge_dyn(
-                        "system.cpu.steal",
-                        current.steal.saturating_sub(prev_val.steal) as f64 / d * 100.0,
-                        labels,
-                    );
-                }
+                emit_deltas(sink, label, prev_val, &current);
                 *prev_val = current;
+                had_baseline = true;
             } else {
                 self.prev.insert(cpu_name.to_string(), current);
             }
+        }
+
+        // Same first-tick rule as the percentages: nothing until a baseline.
+        if had_baseline && cores > 0 {
+            sink.gauge("system.cpu.count", cores as f64, &[]);
+        }
+    }
+}
+
+/// Map a /proc/stat row name to its `core` label: `cpu` → `total`,
+/// `cpuN` → `N`. Any other row (intr, ctxt, ...) yields `None`.
+fn cpu_label(cpu_name: &str) -> Option<&str> {
+    let suffix = cpu_name.strip_prefix("cpu")?;
+    if suffix.is_empty() {
+        return Some("total");
+    }
+    suffix.bytes().all(|b| b.is_ascii_digit()).then_some(suffix)
+}
+
+/// Emit the interval percentages for one CPU row from two samples.
+///
+/// `system.cpu.busy_percent` (100 - idle) is emitted only for the
+/// all-CPU row (`core="total"`), keeping one series per host.
+fn emit_deltas(sink: &Sink, label: &str, prev: &CpuTimes, current: &CpuTimes) {
+    let dt = current.total().saturating_sub(prev.total());
+    if dt == 0 {
+        return;
+    }
+    let d = dt as f64;
+    let labels: &[(&'static str, &str)] = &[("core", label)];
+    let pct = |cur: u64, old: u64| cur.saturating_sub(old) as f64 / d * 100.0;
+
+    let idle = pct(current.idle, prev.idle);
+    let user = pct(current.user + current.nice, prev.user + prev.nice);
+    let system = pct(current.kernel(), prev.kernel());
+    sink.gauge_dyn("system.cpu.user", user, labels);
+    sink.gauge_dyn("system.cpu.system", system, labels);
+    sink.gauge_dyn("system.cpu.idle", idle, labels);
+    let iowait = pct(current.iowait, prev.iowait);
+    sink.gauge_dyn("system.cpu.iowait", iowait, labels);
+    let steal = pct(current.steal, prev.steal);
+    sink.gauge_dyn("system.cpu.steal", steal, labels);
+
+    if label == "total" {
+        if let Some(busy) = cpu_busy_percent(idle) {
+            sink.gauge_dyn("system.cpu.busy_percent", busy, labels);
         }
     }
 }

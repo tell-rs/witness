@@ -2,9 +2,9 @@
 
 ## System Metrics
 
-- CPU utilization — user, system, idle, iowait, and steal percentages per tick.
-- Memory usage — total, available, used, cached, and swap.
-- Load averages — 1, 5, and 15 minute system load.
+- CPU utilization — user, system, idle, iowait, and steal percentages per tick, an all-CPU busy percent, and the logical CPU count.
+- Memory usage — total, available, used, cached, and swap, plus used percent and swap used percent (when swap exists).
+- Load averages — 1, 5, and 15 minute system load, and 1 minute load per CPU.
 - Disk I/O and space — read/write bytes (delta) per device; total, used, free, and available bytes, used percent (matches df's Use%), and inode usage per filesystem. Bind mounts report once; network filesystems are opt-in.
 - Network traffic — bytes and packets sent/received per interface (delta).
 - TCP connections — connection count by state (Linux only).

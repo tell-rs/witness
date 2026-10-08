@@ -1,7 +1,11 @@
 //! Memory collector — reads /proc/meminfo.
 //!
 //! Emits gauges (bytes): system.memory.total, .available, .used, .cached, .swap_used
+//! and gauges (percentage, 0-100): system.memory.used_percent, and
+//! system.memory.swap_used_percent when the host has swap (SwapTotal > 0).
+//! See `metrics::derived` for the exact definitions.
 
+use crate::metrics::derived::{memory_used_percent, swap_used_percent};
 use crate::metrics::{Collector, read_procfs};
 use crate::sink::Sink;
 
@@ -46,12 +50,18 @@ impl Collector for MemoryCollector {
         }
         if let (Some(total), Some(avail)) = (mem_total, mem_available) {
             sink.gauge("system.memory.used", total - avail, &[]);
+            if let Some(pct) = memory_used_percent(total, avail) {
+                sink.gauge("system.memory.used_percent", pct, &[]);
+            }
         }
         if let Some(c) = cached {
             sink.gauge("system.memory.cached", c, &[]);
         }
         if let (Some(st), Some(sf)) = (swap_total, swap_free) {
             sink.gauge("system.memory.swap_used", st - sf, &[]);
+            if let Some(pct) = swap_used_percent(st, st - sf) {
+                sink.gauge("system.memory.swap_used_percent", pct, &[]);
+            }
         }
     }
 }

@@ -126,3 +126,39 @@ fn test_memory_collector_emits_consistent_total_and_used() {
     assert!(totals[0] > 0.0);
     assert_eq!(useds[0], totals[0] - availables[0]);
 }
+
+#[test]
+fn test_memory_collector_emits_used_percent_matching_bytes() {
+    let cap = Capture::new();
+    let sink = Sink::capture(cap.clone(), HashMap::new());
+    let mut collector = MemoryCollector;
+    let mut buf = String::new();
+
+    collector.collect(&sink, "test-host", &mut buf);
+
+    let totals = cap.metric_values("system.memory.total");
+    let useds = cap.metric_values("system.memory.used");
+    let pcts = cap.metric_values("system.memory.used_percent");
+    assert_eq!(pcts.len(), 1);
+    assert!((0.0..=100.0).contains(&pcts[0]));
+    assert!((pcts[0] - useds[0] / totals[0] * 100.0).abs() < 1e-9);
+}
+
+#[test]
+fn test_memory_collector_swap_percent_only_when_swap_present() {
+    let cap = Capture::new();
+    let sink = Sink::capture(cap.clone(), HashMap::new());
+    let mut collector = MemoryCollector;
+    let mut buf = String::new();
+
+    collector.collect(&sink, "test-host", &mut buf);
+
+    let swap_total = field(&buf, "SwapTotal").unwrap_or(0.0);
+    let pcts = cap.metric_values("system.memory.swap_used_percent");
+    if swap_total > 0.0 {
+        assert_eq!(pcts.len(), 1);
+        assert!((0.0..=100.0).contains(&pcts[0]));
+    } else {
+        assert!(pcts.is_empty(), "no swap must emit no swap_used_percent");
+    }
+}

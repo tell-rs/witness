@@ -34,13 +34,17 @@ fn test_load_collector_emits_at_most_three_gauges_named_load_1_5_15() {
     // /proc/loadavg has 5 whitespace fields ("0.52 0.58 0.59 1/1234 5678")
     // but the collector only ever reads the first three — the running/total
     // process count and last pid must never surface as metrics.
-    assert!(events.len() <= 3, "unexpected extra metrics: {events:?}");
+    // Plus the derived load.1_per_cpu.
+    assert!(events.len() <= 4, "unexpected extra metrics: {events:?}");
 
     let mut seen_names: Vec<&str> = Vec::new();
     for event in &events {
         if let Recorded::Metric { name, value, .. } = event {
             assert!(
-                matches!(*name, "system.load.1" | "system.load.5" | "system.load.15"),
+                matches!(
+                    *name,
+                    "system.load.1" | "system.load.5" | "system.load.15" | "system.load.1_per_cpu"
+                ),
                 "unexpected metric name: {name}"
             );
             assert!(value.is_finite());
@@ -69,5 +73,28 @@ fn test_load_collector_gauges_carry_no_labels() {
                 "load metrics should be host-global, unlabeled"
             );
         }
+    }
+}
+
+#[test]
+fn test_load_collector_per_cpu_is_load1_over_online_cpus() {
+    let cap = Capture::new();
+    let sink = Sink::capture(cap.clone(), HashMap::new());
+    let mut collector = LoadCollector;
+    let mut buf = String::new();
+
+    collector.collect(&sink, "test-host", &mut buf);
+
+    let load1 = cap.metric_values("system.load.1");
+    let per_cpu = cap.metric_values("system.load.1_per_cpu");
+    let online = std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .ok()
+        .and_then(|s| crate::metrics::derived::count_cpu_list(&s));
+    match (load1.first(), online) {
+        (Some(l), Some(n)) => {
+            assert_eq!(per_cpu.len(), 1);
+            assert!((per_cpu[0] - l / n as f64).abs() < 1e-9);
+        }
+        _ => assert!(per_cpu.is_empty()),
     }
 }

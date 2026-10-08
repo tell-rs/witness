@@ -52,9 +52,9 @@ Reads your log files and forwards every line to your collector. System logs, app
 
 Collected every 15 seconds (configurable). All enabled by default, individually toggleable.
 
-- **CPU** — per-core user, system, idle, iowait, and steal percentages
-- **Memory** — total, available, used, cached, and swap
-- **Load** — 1, 5, and 15 minute averages
+- **CPU** — per-core user, system, idle, iowait, and steal percentages; all-CPU busy percent and CPU count
+- **Memory** — total, available, used, cached, and swap, with used and swap used percent
+- **Load** — 1, 5, and 15 minute averages, and 1 minute load per CPU
 - **Disk** — read/write bytes and ops per device; space, available bytes, used percent, and inodes per filesystem
 - **Network** — bytes, packets, errors, and drops per interface
 - **TCP** — connection counts by state

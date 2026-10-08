@@ -2,13 +2,18 @@
 //!
 //! Emits gauges (percentage, 0-100):
 //! - system.cpu.user, .system, .idle
+//!   Labels: {core: "total"} or {core: "0"}, {core: "1"}, ...
+//! - system.cpu.busy_percent = 100 - idle, all CPUs only ({core: "total"})
 //!
-//! Labels: {core: "total"} or {core: "0"}, {core: "1"}, ...
+//! And an unlabeled gauge: system.cpu.count (logical CPUs reported by
+//! host_processor_info).
+//!
 //! First tick stores baseline — no metrics emitted until second tick.
 
 use std::collections::HashMap;
 
 use crate::metrics::Collector;
+use crate::metrics::derived::cpu_busy_percent;
 use crate::sink::Sink;
 
 pub struct CpuCollector {
@@ -59,7 +64,11 @@ impl Collector for CpuCollector {
             total.nice += ticks.nice;
         }
 
+        let had_baseline = self.prev.contains_key("total");
         emit_cpu(sink, "total", &total, &mut self.prev);
+        if had_baseline {
+            sink.gauge("system.cpu.count", per_cpu.len() as f64, &[]);
+        }
 
         for (i, ticks) in per_cpu.iter().enumerate() {
             let label = i.to_string();
@@ -82,11 +91,13 @@ fn emit_cpu(sink: &Sink, label: &str, current: &CpuTicks, prev: &mut HashMap<Str
                 current.system.saturating_sub(prev_val.system) as f64 / d * 100.0,
                 labels,
             );
-            sink.gauge_dyn(
-                "system.cpu.idle",
-                current.idle.saturating_sub(prev_val.idle) as f64 / d * 100.0,
-                labels,
-            );
+            let idle = current.idle.saturating_sub(prev_val.idle) as f64 / d * 100.0;
+            sink.gauge_dyn("system.cpu.idle", idle, labels);
+            if label == "total" {
+                if let Some(busy) = cpu_busy_percent(idle) {
+                    sink.gauge_dyn("system.cpu.busy_percent", busy, labels);
+                }
+            }
         }
     }
 

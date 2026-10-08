@@ -120,16 +120,21 @@ async fn collectors_transmit_all_metrics() {
         ("system.load.1", "load"),
         ("system.load.5", "load"),
         ("system.load.15", "load"),
+        ("system.load.1_per_cpu", "load"),
         // CPU
         ("system.cpu.user", "cpu"),
         ("system.cpu.system", "cpu"),
         ("system.cpu.idle", "cpu"),
+        ("system.cpu.busy_percent", "cpu"),
+        ("system.cpu.count", "cpu"),
         // Memory
         ("system.memory.total", "memory"),
         ("system.memory.available", "memory"),
         ("system.memory.used", "memory"),
         ("system.memory.cached", "memory"),
         ("system.memory.swap_used", "memory"),
+        ("system.memory.used_percent", "memory"),
+        ("system.memory.swap_used_percent", "memory"),
         // Network
         ("system.net.bytes_recv", "network"),
         ("system.net.bytes_sent", "network"),
@@ -192,7 +197,7 @@ async fn collectors_transmit_all_metrics() {
     // Allow swap to be missing (some Macs have swap disabled)
     let hard_missing: Vec<_> = missing
         .iter()
-        .filter(|(name, _)| *name != "system.memory.swap_used")
+        .filter(|(name, _)| !name.starts_with("system.memory.swap_used"))
         .collect();
 
     assert!(

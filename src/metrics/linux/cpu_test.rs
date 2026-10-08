@@ -161,6 +161,12 @@ fn test_cpu_collector_second_tick_values_are_valid_percentages() {
         {
             assert!(name.starts_with("system.cpu."), "unexpected metric {name}");
             assert!(value.is_finite());
+            if name == "system.cpu.count" {
+                // Unlabeled host-global count, not a percentage.
+                assert!(value >= 1.0, "cpu count must be positive: {value}");
+                assert!(labels.is_empty());
+                continue;
+            }
             assert!(
                 (0.0..=100.0).contains(&value),
                 "{name} out of range: {value}"
@@ -168,4 +174,35 @@ fn test_cpu_collector_second_tick_values_are_valid_percentages() {
             assert!(labels.iter().any(|(k, _)| k == "core"));
         }
     }
+}
+
+#[test]
+fn test_cpu_collector_second_tick_emits_count_and_busy_for_total_only() {
+    let cap = Capture::new();
+    let sink = Sink::capture(cap.clone(), HashMap::new());
+    let mut collector = CpuCollector::new();
+    let mut buf = String::new();
+
+    collector.collect(&sink, "test-host", &mut buf);
+    collector.collect(&sink, "test-host", &mut buf);
+
+    let counts = cap.metric_values("system.cpu.count");
+    assert_eq!(counts.len(), 1, "one cpu.count per tick after baseline");
+    let cores = buf.lines().filter(|l| cpu_label_is_core(l)).count();
+    assert_eq!(counts[0], cores as f64);
+
+    for event in cap.events() {
+        if let Recorded::Metric { name, labels, .. } = event {
+            if name == "system.cpu.busy_percent" {
+                assert_eq!(labels, vec![("core".to_string(), "total".to_string())]);
+            }
+        }
+    }
+}
+
+/// A /proc/stat row for one logical CPU ("cpu0 ...", not the "cpu " total).
+fn cpu_label_is_core(line: &str) -> bool {
+    let name = line.split_whitespace().next().unwrap_or("");
+    name.strip_prefix("cpu")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }

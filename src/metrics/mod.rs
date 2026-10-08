@@ -15,6 +15,10 @@ use self::linux as platform;
 use self::macos as platform;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod derived;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod derived_test;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod disk_space;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod disk_space_test;
